@@ -2,6 +2,7 @@ import os
 import sys
 import re
 import json
+import shutil
 import asyncio
 import subprocess
 import requests
@@ -10,18 +11,27 @@ from PIL import Image, ImageDraw, ImageFont
 import google.generativeai as genai
 import edge_tts
 
-# تثبيت مكتبات تعديل الحروف العربية تلقائياً إن لم تكن موجودة
+# تثبيت المكتبات المطلوبة تلقائياً إن لم تكن موجودة
+subprocess.run(
+    [sys.executable, "-m", "pip", "install", "-q", "arabic-reshaper", "python-bidi", "mutagen"],
+    check=False
+)
+
 try:
     import arabic_reshaper
     from bidi.algorithm import get_display
 except ImportError:
-    subprocess.run([sys.executable, "-m", "pip", "install", "-q", "arabic-reshaper", "python-bidi"], check=False)
-    try:
-        import arabic_reshaper
-        from bidi.algorithm import get_display
-    except ImportError:
-        arabic_reshaper = None
-        get_display = None
+    arabic_reshaper = None
+    get_display = None
+
+# تحديد مسار FFmpeg أو جلبه تلقائياً
+FFMPEG_BIN = shutil.which("ffmpeg")
+if not FFMPEG_BIN:
+    subprocess.run([sys.executable, "-m", "pip", "install", "-q", "imageio-ffmpeg"], check=False)
+    import imageio_ffmpeg
+    FFMPEG_BIN = imageio_ffmpeg.get_ffmpeg_exe()
+
+print(f"مسار FFmpeg جاهز: {FFMPEG_BIN}")
 
 
 def fix_arabic(text):
@@ -29,6 +39,24 @@ def fix_arabic(text):
         reshaped = arabic_reshaper.reshape(text)
         return get_display(reshaped)
     return text
+
+
+def get_audio_duration(audio_file):
+    try:
+        from mutagen.mp3 import MP3
+        return float(MP3(audio_file).info.length)
+    except Exception:
+        res = subprocess.run(
+            [FFMPEG_BIN, "-i", audio_file],
+            stderr=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            text=True
+        )
+        m = re.search(r"Duration:\s*(\d+):(\d+):(\d+\.\d+)", res.stderr)
+        if m:
+            h, mins, secs = map(float, m.groups())
+            return h * 3600 + mins * 60 + secs
+        return 3.5
 
 
 # 1. إعداد المفاتيح والاتصالات
@@ -39,7 +67,7 @@ FB_PAGE_ID = os.getenv("FB_PAGE_ID")
 genai.configure(api_key=GEMINI_API_KEY, transport="rest")
 
 
-# 2. توليد المحتوى بالذكاء الاصطناعي (مع مهلة سريعة تمنع التعليق)
+# 2. توليد المحتوى بالذكاء الاصطناعي
 async def generate_script():
     print("جاري توليد السيناريو...")
     prompt = """
@@ -202,15 +230,14 @@ async def make_video(script_data):
         pose = sc["pose"]
         audio_file = f"scene_{idx}.mp3"
 
-        duration_cmd = f"ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 {audio_file}"
-        duration = float(subprocess.check_output(duration_cmd, shell=True).decode().strip())
+        duration = get_audio_duration(audio_file)
         total_frames = max(int(duration * fps), 15)
 
-        print(f"ريندر سريع للمشهد {idx+1}/{len(scenes)} ({total_frames} إطار)...")
+        print(f"ريندر سريع للمشهد {idx+1}/{len(scenes)} ({duration:.1f} ثانية / {total_frames} إطار)...")
         output_scene = f"scene_{idx}.mp4"
 
         ffmpeg_cmd = [
-            "ffmpeg", "-y",
+            FFMPEG_BIN, "-y",
             "-f", "rawvideo",
             "-vcodec", "rawvideo",
             "-pix_fmt", "rgb24",
@@ -249,8 +276,15 @@ async def make_video(script_data):
             file.write(f"file '{clip}'\n")
 
     final_output = "final_reel.mp4"
-    merge_cmd = f"ffmpeg -y -f concat -safe 0 -i inputs.txt -c copy {final_output}"
-    subprocess.run(merge_cmd, shell=True, check=True)
+    merge_cmd = [
+        FFMPEG_BIN, "-y",
+        "-f", "concat",
+        "-safe", "0",
+        "-i", "inputs.txt",
+        "-c", "copy",
+        final_output
+    ]
+    subprocess.run(merge_cmd, check=True)
 
     for clip in video_clips:
         os.remove(clip)
