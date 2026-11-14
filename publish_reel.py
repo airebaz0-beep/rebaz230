@@ -20,8 +20,7 @@ genai.configure(api_key=GEMINI_API_KEY,transport="rest")
 
 # 2. توليد المحتوى بالذكاء الاصطناعي
 async def generate_script():
-        models = [m.name for m in genai.list_models() if "generateContent" in m.supported_generation_methods]
-    model = genai.GenerativeModel(next((m for m in models if "flash" in m), models[0]))
+    model = genai.GenerativeModel(next(m.name for m in genai.list_models() if "generateContent" in m.supported_generation_methods and "flash" in m.name))
 
     prompt = """
     اكتب سيناريو فيديو ريلز (Reel) قصير وشيق جداً باللهجة العراقية المبسطة أو العربية الفصحى الخفيفة عن (معلومة غريبة، حقيقة تكنولوجية، أو نصيحة ذهبية سريعة).
