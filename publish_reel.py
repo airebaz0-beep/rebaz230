@@ -1,14 +1,35 @@
 import os
-import requests
-import asyncio
-import json
-import random
+import sys
 import re
-from PIL import Image, ImageDraw, ImageFont
+import json
+import asyncio
+import subprocess
+import requests
 import numpy as np
+from PIL import Image, ImageDraw, ImageFont
 import google.generativeai as genai
 import edge_tts
-import subprocess
+
+# تثبيت مكتبات تعديل الحروف العربية تلقائياً إن لم تكن موجودة
+try:
+    import arabic_reshaper
+    from bidi.algorithm import get_display
+except ImportError:
+    subprocess.run([sys.executable, "-m", "pip", "install", "-q", "arabic-reshaper", "python-bidi"], check=False)
+    try:
+        import arabic_reshaper
+        from bidi.algorithm import get_display
+    except ImportError:
+        arabic_reshaper = None
+        get_display = None
+
+
+def fix_arabic(text):
+    if arabic_reshaper and get_display:
+        reshaped = arabic_reshaper.reshape(text)
+        return get_display(reshaped)
+    return text
+
 
 # 1. إعداد المفاتيح والاتصالات
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
@@ -18,104 +39,101 @@ FB_PAGE_ID = os.getenv("FB_PAGE_ID")
 genai.configure(api_key=GEMINI_API_KEY, transport="rest")
 
 
-# 2. توليد المحتوى بالذكاء الاصطناعي
+# 2. توليد المحتوى بالذكاء الاصطناعي (مع مهلة سريعة تمنع التعليق)
 async def generate_script():
-    model = None
-    for m in genai.list_models():
-        if (
-            "generateContent" in m.supported_generation_methods
-            and "flash" in m.name
-            and "image" not in m.name
-            and "tts" not in m.name
-        ):
-            try:
-                candidate = genai.GenerativeModel(m.name)
-                candidate.generate_content("1")
-                model = candidate
-                break
-            except Exception:
-                continue
-
+    print("جاري توليد السيناريو...")
     prompt = """
-    اكتب سيناريو فيديو ريلز (Reel) قصير وشيق جداً باللهجة العراقية المبسطة أو العربية الفصحى الخفيفة عن (معلومة غريبة، حقيقة تكنولوجية، أو نصيحة ذهبية سريعة).
-    يجب أن يكون النص مقسماً إلى 5 أو 6 جمل قصيرة جداً (كل جملة لا تتعدى 5 كلمات) لتناسب الموشن جرافيك السريع.
+    اكتب سيناريو فيديو ريلز (Reel) قصير وشيق جداً باللهجة العراقية المبسطة عن (معلومة غريبة، حقيقة تكنولوجية، أو نصيحة ذهبية للموبايل).
+    يجب أن يكون النص مقسماً إلى 4 أو 5 جمل قصيرة جداً (كل جملة 3 إلى 5 كلمات فقط) لتناسب الموشن جرافيك السريع.
     حدد لكل جملة واحدة من هذه الحركات الستة المناسبة لشخصية الستيك مان:
-    [WELCOME (ترحيب), THINKING (تفكير), EXPLAINING (شرح), IDEA (فكرة وإلهام), PUZZLED (حيرة), SUCCESS (إنجاز وتأكيد)].
+    [WELCOME, THINKING, EXPLAINING, IDEA, PUZZLED, SUCCESS].
     
-    أرجع النتيجة بصيغة JSON فقط كالتالي:
+    أرجع النتيجة بصيغة JSON فقط بدون أي كلام إضافي:
     {
-      "title": "عنوان مشوق وقصير جداً",
-      "caption": "وصف الريلز مع هاشتاغات مناسبة",
+      "title": "عنوان مشوق وقصير",
+      "caption": "وصف الريلز مع هاشتاغات مناسبة #تكنولوجيا #معلومات #العراق",
       "scenes": [
         {"text": "الجملة الأولى هنا", "pose": "WELCOME"},
         {"text": "الجملة الثانية هنا", "pose": "THINKING"},
         {"text": "الجملة الثالثة هنا", "pose": "EXPLAINING"},
-        {"text": "الجملة الرابعة هنا", "pose": "PUZZLED"},
-        {"text": "الجملة الخامسة هنا", "pose": "IDEA"},
-        {"text": "الجملة السادسة هنا", "pose": "SUCCESS"}
+        {"text": "الجملة الرابعة هنا", "pose": "IDEA"}
       ]
     }
     """
-    response = model.generate_content(prompt)
     try:
-        text = response.text.strip()
-        if "```json" in text:
-            text = text.split("```json")[1].split("```")[0].strip()
-        return json.loads(text)
+        model = None
+        for m in genai.list_models():
+            if (
+                "generateContent" in m.supported_generation_methods
+                and "flash" in m.name
+                and "image" not in m.name
+                and "tts" not in m.name
+            ):
+                try:
+                    candidate = genai.GenerativeModel(m.name)
+                    candidate.generate_content("1", request_options={"timeout": 15})
+                    model = candidate
+                    print(f"تم الاتصال بالنموذج: {m.name}")
+                    break
+                except Exception:
+                    continue
+
+        if model:
+            response = model.generate_content(prompt, request_options={"timeout": 20})
+            text = response.text.strip()
+            if "```json" in text:
+                text = text.split("```json")[1].split("```")[0].strip()
+            elif "```" in text:
+                text = text.split("```")[1].split("```")[0].strip()
+            data = json.loads(text)
+            if "scenes" in data and len(data["scenes"]) > 0:
+                return data
     except Exception as e:
-        print("خطأ في قراءة الـ JSON:", e)
-        return {
-            "title": "معلومة سريعة!",
-            "caption": "هل كنت تعرف هذه المعلومة؟ 🤔💬 #معلومات #تكنولوجيا #ستيك_مان",
-            "scenes": [
-                {"text": "هلو عيوني! اليوم جبتلكم معلومة سريعة", "pose": "WELCOME"},
-                {"text": "عمرك فكرت شلون يشتغل الذكاء الاصطناعي؟", "pose": "THINKING"},
-                {"text": "هو مثل عقلك بس يقرأ ملايين البيانات بثانية", "pose": "EXPLAINING"},
-                {"text": "يعني مو سحر، السالفة كلها رياضيات!", "pose": "PUZZLED"},
-                {"text": "وتكدر تستفاد منه اليوم لتسهيل شغلك!", "pose": "IDEA"},
-                {"text": "جربوه وشاركوني رأيكم بالتعليقات!", "pose": "SUCCESS"}
-            ]
-        }
+        print("تم استخدام السيناريو الاحتياطي بسبب:", e)
+
+    return {
+        "title": "سر بطارية موبايلك!",
+        "caption": "ليش بطارية موبايلك تخلص بسرعة؟ معلومة تهمك! 🔋📱 #معلومات #تكنولوجيا #موبايل",
+        "scenes": [
+            {"text": "تدري ليش بطاريتك تخلص بسرعة؟", "pose": "WELCOME"},
+            {"text": "أغلب التطبيقات تشتغل بالخلفية دائماً", "pose": "THINKING"},
+            {"text": "وتسحب شحن وإنترنت بدون ما تدري", "pose": "EXPLAINING"},
+            {"text": "طفي التحديث التلقائي وراح يفرق وياك!", "pose": "SUCCESS"}
+        ]
+    }
 
 
-# 3. رسم شخصية الستيك مان B حركياً (وضعيات 2D)
+# 3. رسم شخصية الستيك مان حركياً
 def draw_stickman(pose, frame_num, size=(1080, 1920)):
-    img = Image.new("RGBA", size, "#0B0F19")
+    img = Image.new("RGB", size, "#0B0F19")
     draw = ImageDraw.Draw(img)
 
-    for i in range(0, size[0], 80):
+    for i in range(0, size[0], 120):
         draw.line([(i, 0), (i, size[1])], fill="#141B2D", width=1)
-    for j in range(0, size[1], 80):
+    for j in range(0, size[1], 120):
         draw.line([(0, j), (size[0], j)], fill="#141B2D", width=1)
-
-    offset = (frame_num * 3) % 80
-    for y in range(offset, size[1], 160):
-        draw.line([(0, y), (size[0], y)], fill="#1E2942", width=2)
 
     primary_color = "#1A365D"
     glow_color = "#00F0FF"
     line_width = 16
 
-    cx, cy = 540, 960
-    bob = int(np.sin(frame_num * 0.15) * 8)
+    cx, cy = 540, 920
+    bob = int(np.sin(frame_num * 0.25) * 8)
     cy += bob
 
+    # الجسم والرأس والسماعات
     draw.line([(cx, cy), (cx, cy + 250)], fill=primary_color, width=line_width)
     draw.line([(cx, cy + 250), (cx - 80, cy + 450)], fill=primary_color, width=line_width)
     draw.line([(cx, cy + 250), (cx + 80, cy + 450)], fill=primary_color, width=line_width)
-
     draw.ellipse([(cx - 100, cy - 200), (cx + 100, cy)], outline=primary_color, width=line_width)
 
     draw.ellipse([(cx - 120, cy - 130), (cx - 95, cy - 70)], fill=glow_color, outline=primary_color, width=6)
     draw.ellipse([(cx + 95, cy - 130), (cx + 120, cy - 70)], fill=glow_color, outline=primary_color, width=6)
     draw.arc([(cx - 105, cy - 205), (cx + 105, cy - 90)], start=180, end=360, fill=primary_color, width=12)
 
-    draw.line([(cx - 110, cy - 80), (cx - 60, cy - 50)], fill=primary_color, width=6)
-    draw.ellipse([(cx - 62, cy - 52), (cx - 52, cy - 42)], fill=glow_color)
-
     if pose == "WELCOME":
         draw.line([(cx, cy + 50), (cx - 100, cy + 180)], fill=primary_color, width=line_width)
-        wave = int(np.sin(frame_num * 0.3) * 25)
+        wave = int(np.sin(frame_num * 0.4) * 25)
         draw.line([(cx, cy + 50), (cx + 100, cy - 20), (cx + 140 + wave, cy - 100)], fill=primary_color, width=line_width)
         draw.ellipse([(cx - 45, cy - 125), (cx - 25, cy - 105)], fill=primary_color)
         draw.ellipse([(cx + 25, cy - 125), (cx + 45, cy - 105)], fill=primary_color)
@@ -127,52 +145,33 @@ def draw_stickman(pose, frame_num, size=(1080, 1920)):
         draw.ellipse([(cx - 40, cy - 125), (cx - 20, cy - 105)], fill=primary_color)
         draw.ellipse([(cx + 20, cy - 125), (cx + 40, cy - 105)], fill=primary_color)
         draw.line([(cx - 25, cy - 70), (cx + 25, cy - 70)], fill=primary_color, width=6)
-        q_y = cy - 260 + int(np.sin(frame_num * 0.1) * 5)
-        draw.text((cx + 110, q_y), "?", fill=glow_color, font_size=80)
 
     elif pose == "EXPLAINING":
-        explain_l = int(np.sin(frame_num * 0.2) * 15)
+        explain_l = int(np.sin(frame_num * 0.3) * 15)
         draw.line([(cx, cy + 50), (cx - 110 - explain_l, cy - 20), (cx - 160 - explain_l, cy - 30)], fill=primary_color, width=line_width)
         draw.line([(cx, cy + 50), (cx + 110, cy + 30), (cx + 170, cy + 60)], fill=primary_color, width=line_width)
         draw.ellipse([(cx - 40, cy - 125), (cx - 20, cy - 105)], fill=primary_color)
         draw.ellipse([(cx + 20, cy - 125), (cx + 40, cy - 105)], fill=primary_color)
-        draw.arc([(cx - 30, cy - 90), (cx + 30, cy - 50)], start=0, end=180, fill=primary_color, width=6)
 
     elif pose == "IDEA":
         draw.line([(cx, cy + 50), (cx - 80, cy + 100), (cx - 40, cy + 160)], fill=primary_color, width=line_width)
         draw.line([(cx, cy + 50), (cx + 90, cy + 20), (cx + 110, cy - 100)], fill=primary_color, width=line_width)
-        bulb_y = cy - 260 + int(np.cos(frame_num * 0.2) * 4)
+        bulb_y = cy - 260 + int(np.cos(frame_num * 0.3) * 4)
         draw.ellipse([(cx + 90, bulb_y), (cx + 130, bulb_y + 40)], fill=glow_color)
-        draw.line([(cx + 110, bulb_y + 40), (cx + 110, bulb_y + 55)], fill="#FFA500", width=8)
         draw.ellipse([(cx - 45, cy - 130), (cx - 25, cy - 110)], fill=primary_color)
         draw.ellipse([(cx + 25, cy - 130), (cx + 45, cy - 110)], fill=primary_color)
-        draw.arc([(cx - 40, cy - 95), (cx + 40, cy - 45)], start=10, end=170, fill=primary_color, width=8)
-
-    elif pose == "PUZZLED":
-        draw.line([(cx, cy + 50), (cx - 90, cy - 30), (cx - 50, cy - 150)], fill=primary_color, width=line_width)
-        draw.line([(cx, cy + 50), (cx + 90, cy + 170)], fill=primary_color, width=line_width)
-        draw.ellipse([(cx - 40, cy - 120), (cx - 25, cy - 105)], fill=primary_color)
-        draw.ellipse([(cx + 25, cy - 120), (cx + 40, cy - 105)], fill=primary_color)
-        draw.line([(cx - 45, cy - 135), (cx - 20, cy - 130)], fill=primary_color, width=6)
-        draw.line([(cx + 20, cy - 130), (cx + 45, cy - 135)], fill=primary_color, width=6)
-        draw.arc([(cx - 25, cy - 80), (cx + 25, cy - 50)], start=180, end=360, fill=primary_color, width=6)
 
     else:
         draw.line([(cx, cy + 50), (cx - 80, cy + 100), (cx - 40, cy + 160)], fill=primary_color, width=line_width)
         draw.line([(cx, cy + 50), (cx + 100, cy + 20), (cx + 140, cy - 30)], fill=primary_color, width=line_width)
-        draw.ellipse([(cx + 135, cy - 45), (cx + 155, cy - 25)], fill=glow_color)
         draw.ellipse([(cx - 45, cy - 125), (cx - 25, cy - 105)], fill=primary_color)
         draw.ellipse([(cx + 25, cy - 125), (cx + 45, cy - 105)], fill=primary_color)
-        draw.arc([(cx - 45, cy - 100), (cx + 45, cy - 40)], start=10, end=170, fill=primary_color, width=10)
-        for i in range(3):
-            sx = cx + 180 + int(np.sin(frame_num * 0.2 + i) * 15)
-            sy = cy - 100 - i * 60
-            draw.text((sx, sy), "✦", fill=glow_color, font_size=40)
+        draw.arc([(cx - 40, cy - 100), (cx + 40, cy - 40)], start=10, end=170, fill=primary_color, width=8)
 
     return img
 
 
-# 4. تجميع الفيديو بالصوت والكتابة والتحريك
+# 4. تجميع الفيديو بسرعة فائقة عبر الذاكرة (Pipe)
 async def make_video(script_data):
     print("بدء صناعة ريلز الستيك مان...")
     scenes = script_data["scenes"]
@@ -186,48 +185,64 @@ async def make_video(script_data):
         await communicate.save(audio_fn)
         audio_paths.append(audio_fn)
 
-    font_path = "Cairo-Bold.ttf"
-    if not os.path.exists(font_path):
-        print("تحميل الخط العربي...")
-        font_url = "[https://github.com/google/fonts/raw/main/ofl/cairo/Cairo%5Bwght%5D.ttf](https://github.com/google/fonts/raw/main/ofl/cairo/Cairo%5Bwght%5D.ttf)"
-        r = requests.get(font_url)
-        with open(font_path, "wb") as f:
-            f.write(r.content)
+    font_path = "AQEEQ_SANS_PRO_ExtraLight.otf"
+    if os.path.exists(font_path):
+        print(f"تم تحميل الخط المحلي بنجاح: {font_path}")
+        font_title = ImageFont.truetype(font_path, 54)
+    else:
+        print("تحذير: ملف الخط غير موجود، سيتم استخدام الخط الافتراضي.")
+        font_title = ImageFont.load_default()
 
     video_clips = []
+    fps = 15
 
     for idx, sc in enumerate(scenes):
-        text = sc["text"]
+        raw_text = sc["text"]
+        display_text = fix_arabic(raw_text)
         pose = sc["pose"]
         audio_file = f"scene_{idx}.mp3"
 
         duration_cmd = f"ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 {audio_file}"
         duration = float(subprocess.check_output(duration_cmd, shell=True).decode().strip())
-        fps = 30
-        total_frames = int(duration * fps)
+        total_frames = max(int(duration * fps), 15)
 
-        print(f"جاري معالجة المشهد {idx+1}/{len(scenes)} (الوضعية: {pose}, المدة: {duration} ثواني)")
+        print(f"ريندر سريع للمشهد {idx+1}/{len(scenes)} ({total_frames} إطار)...")
+        output_scene = f"scene_{idx}.mp4"
+
+        ffmpeg_cmd = [
+            "ffmpeg", "-y",
+            "-f", "rawvideo",
+            "-vcodec", "rawvideo",
+            "-pix_fmt", "rgb24",
+            "-s", "1080x1920",
+            "-r", str(fps),
+            "-i", "-",
+            "-i", audio_file,
+            "-c:v", "libx264",
+            "-preset", "ultrafast",
+            "-pix_fmt", "yuv420p",
+            "-c:a", "aac",
+            "-shortest",
+            output_scene
+        ]
+
+        proc = subprocess.Popen(ffmpeg_cmd, stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
 
         for f in range(total_frames):
             frame_img = draw_stickman(pose, f)
             draw = ImageDraw.Draw(frame_img)
+            draw.rounded_rectangle([(80, 1480), (1000, 1730)], radius=30, fill="#0F172A", outline="#00F0FF", width=4)
 
-            draw.rounded_rectangle([(100, 1500), (980, 1750)], radius=30, fill="#0F172AEE", outline="#00F0FF", width=4)
-
-            font_title = ImageFont.truetype(font_path, 48)
-            left, top, right, bottom = draw.textbbox((0, 0), text, font=font_title)
+            left, top, right, bottom = draw.textbbox((0, 0), display_text, font=font_title)
             tw = right - left
-            draw.text(((1080 - tw) // 2, 1600), text, fill="#FFFFFF", font=font_title)
+            th = bottom - top
+            draw.text(((1080 - tw) // 2, 1605 - th // 2), display_text, fill="#FFFFFF", font=font_title)
 
-            frame_img.save(f"frame_{idx:03d}_{f:03d}.png")
+            proc.stdin.write(frame_img.tobytes())
 
-        output_scene = f"scene_{idx}.mp4"
-        ffmpeg_cmd = f"ffmpeg -y -framerate {fps} -i frame_{idx:03d}_%03d.png -i {audio_file} -c:v libx264 -pix_fmt yuv420p -c:a aac -shortest {output_scene}"
-        subprocess.run(ffmpeg_cmd, shell=True, check=True)
+        proc.stdin.close()
+        proc.wait()
         video_clips.append(output_scene)
-
-        for f in range(total_frames):
-            os.remove(f"frame_{idx:03d}_{f:03d}.png")
 
     with open("inputs.txt", "w") as file:
         for clip in video_clips:
@@ -243,39 +258,41 @@ async def make_video(script_data):
         os.remove(audio)
     os.remove("inputs.txt")
 
-    print(f"تم توليد ريلز الستيك مان بنجاح! {final_output}")
+    print(f"اكتمل بناء الفيديو بنجاح: {final_output}")
     return final_output
 
 
-# 5. نشر الفيديو على بيج فيسبوك (تلقائياً)
+# 5. نشر الفيديو على بيج فيسبوك مع طباعة رد السيرفر بدقة
 def publish_to_facebook(video_path, title, caption):
     print("بدء عملية النشر على فيسبوك ريلز...")
+    if not FB_ACCESS_TOKEN or not FB_PAGE_ID:
+        print("خطأ: FB_ACCESS_TOKEN أو FB_PAGE_ID غير موجود في Secrets!")
+        sys.exit(1)
 
-    init_url = f"[https://graph.facebook.com/v18.0/](https://graph.facebook.com/v18.0/){FB_PAGE_ID}/video_reels"
-    init_params = {
-        "access_token": FB_ACCESS_TOKEN,
-        "upload_phase": "start"
-    }
+    init_url = f"https://graph.facebook.com/v20.0/{FB_PAGE_ID}/video_reels"
+    init_params = {"access_token": FB_ACCESS_TOKEN, "upload_phase": "start"}
     init_res = requests.post(init_url, params=init_params).json()
-    print("الاستجابة الأولى:", init_res)
+    print("رد فيسبوك (مرحلة البدء):", init_res)
 
     video_id = init_res.get("video_id")
     upload_url = init_res.get("upload_url")
 
     if not video_id or not upload_url:
-        print("خطأ في بدء جلسة الرفع بالفيسبوك!")
-        return False
+        print("فشل بدء جلسة الرفع! راجع صلاحيات التوكن أعلاه.")
+        sys.exit(1)
 
+    file_size = os.path.getsize(video_path)
     headers = {
         "Authorization": f"OAuth {FB_ACCESS_TOKEN}",
         "offset": "0",
-        "file_size": str(os.path.getsize(video_path))
+        "file_size": str(file_size),
+        "Content-Type": "application/octet-stream"
     }
     with open(video_path, "rb") as f:
-        upload_res = requests.post(upload_url, headers=headers, data=f).json()
-    print("استجابة الرفع:", upload_res)
+        upload_res = requests.post(upload_url, headers=headers, data=f)
+    print("رد فيسبوك (مرحلة رفع الملف):", upload_res.status_code, upload_res.text)
 
-    publish_url = f"[https://graph.facebook.com/v18.0/](https://graph.facebook.com/v18.0/){FB_PAGE_ID}/video_reels"
+    publish_url = f"https://graph.facebook.com/v20.0/{FB_PAGE_ID}/video_reels"
     publish_params = {
         "access_token": FB_ACCESS_TOKEN,
         "video_id": video_id,
@@ -285,21 +302,18 @@ def publish_to_facebook(video_path, title, caption):
         "description": caption
     }
     publish_res = requests.post(publish_url, params=publish_params).json()
-    print("استجابة النشر النهائية:", publish_res)
+    print("رد فيسبوك (مرحلة النشر النهائي):", publish_res)
 
     if publish_res.get("success") or "video_id" in publish_res:
-        print("مبروك! تم نشر فيديو الستيك مان بنجاح على فيسبوك! 🎉🚀")
+        print("تم نشر الريلز على صفحة فيسبوك بنجاح!")
         return True
-    else:
-        print("حدث خطأ في عملية النشر!")
-        return False
+
+    print("فشل النشر النهائي على فيسبوك!")
+    sys.exit(1)
 
 
-# تشغيل الأوتومايشن
 async def main():
     script_data = await generate_script()
-    print("السيناريو المولد:", json.dumps(script_data, ensure_ascii=False, indent=2))
-
     final_video = await make_video(script_data)
     publish_to_facebook(final_video, script_data["title"], script_data["caption"])
 
