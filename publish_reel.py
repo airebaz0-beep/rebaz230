@@ -20,9 +20,10 @@ genai.configure(api_key=GEMINI_API_KEY,transport="rest")
 
 # 2. توليد المحتوى بالذكاء الاصطناعي
 async def generate_script():
-         model = next(m for d in [{}] for m in [genai.GenerativeModel(x.name) for x in genai.list_models() if "generateContent" in x.supported_generation_methods and "flash" in x.name and "image" not in x.name and "tts" not in x.name] if not exec("try:\n m.generate_content('1')\n d['ok']=True\nexcept:\n d['ok']=False", {"m": m, "d": d}) and d.get("ok"))
 
-    prompt = """
+model = next(m for d in [{}] for m in [genai.GenerativeModel(x.name) for x in genai.list_models() if "generateContent" in x.supported_generation_methods and "flash" in x.name and "image" not in x.name and "tts" not in x.name] if not exec("try:\n m.generate_content('1')\n d['ok']=True\nexcept:\n d['ok']=False", {"m": m, "d": d}) and d.get("ok"))
+
+prompt = """
     اكتب سيناريو فيديو ريلز (Reel) قصير وشيق جداً باللهجة العراقية المبسطة أو العربية الفصحى الخفيفة عن (معلومة غريبة، حقيقة تكنولوجية، أو نصيحة ذهبية سريعة).
     يجب أن يكون النص مقسماً إلى 5 أو 6 جمل قصيرة جداً (كل جملة لا تتعدى 5 كلمات) لتناسب الموشن جرافيك السريع.
     حدد لكل جملة واحدة من هذه الحركات الستة المناسبة لشخصية الستيك مان:
