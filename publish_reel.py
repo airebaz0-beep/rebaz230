@@ -10,6 +10,46 @@ import subprocess
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
 
+
+# ==============================================================================
+# 0. فحص وتجهيز البيئة تلقائياً (FFmpeg + المكتبات + الخطوط العربية)
+# ==============================================================================
+def ensure_runtime_dependencies():
+    if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
+        print("[SETUP] تثبيت FFmpeg والخطوط العربية تلقائياً...")
+        try:
+            subprocess.run(["sudo", "apt-get", "update", "-qq"], check=False)
+            subprocess.run(
+                ["sudo", "apt-get", "install", "-y", "-qq", "ffmpeg", "fonts-noto-core"],
+                check=False
+            )
+        except Exception as e:
+            print(f"[WARN] تعذر التثبيت عبر apt-get: {e}")
+
+    required_pkgs = {
+        "requests": "requests",
+        "edge_tts": "edge-tts",
+        "PIL": "Pillow",
+        "arabic_reshaper": "arabic-reshaper",
+        "bidi": "python-bidi",
+    }
+    missing = []
+    for mod_name, pip_name in required_pkgs.items():
+        try:
+            __import__(mod_name)
+        except ImportError:
+            missing.append(pip_name)
+
+    if missing:
+        print(f"[SETUP] تثبيت مكتبات بايثون الناقصة: {missing}")
+        subprocess.run(
+            [sys.executable, "-m", "pip", "install", "-q", *missing],
+            check=True
+        )
+
+
+ensure_runtime_dependencies()
+
 import requests
 from PIL import Image, ImageDraw, ImageFont
 
@@ -22,13 +62,12 @@ except ImportError:
 
 
 # ==============================================================================
-# 1. إعدادات المشروع والثوابت (متوافقة مع معايير متقن للريلز)
+# 1. إعدادات المشروع والثوابت
 # ==============================================================================
 WIDTH = 1080
 HEIGHT = 1920
 FPS = 30
 
-# الهوامش الآمنة لواجهة ريلز فيسبوك وإنستغرام (10% جوانب وأعلى، 20% أسفل)
 SAFE_LEFT = int(WIDTH * 0.10)
 SAFE_RIGHT = int(WIDTH * 0.90)
 SAFE_TOP = int(HEIGHT * 0.10)
@@ -278,7 +317,7 @@ FALLBACK_STORIES = [
 
 
 # ==============================================================================
-# 3. إدارة سجل المواضيع المنشورة لمنع التكرار أو التشابه في نفس اليوم
+# 3. إدارة سجل المواضيع المنشورة لمنع التكرار
 # ==============================================================================
 def get_iraq_now() -> datetime:
     return datetime.now(timezone(timedelta(hours=3)))
@@ -325,7 +364,6 @@ def choose_next_category(history: list, today_str: str) -> dict:
 # 4. أدوات اللغة العربية، تنظيف النطق، والخطوط
 # ==============================================================================
 def sanitize_spoken_text(text: str) -> str:
-    """يضمن عدم نطق اسم الصفحة مرتين (منسى - Mansa -> مَنْسَى مرة واحدة فقط)."""
     if not text:
         return ""
     cleaned = re.sub(r"منسى\s*[-–—/|]\s*mansa", "مَنْسَى", text, flags=re.IGNORECASE)
@@ -388,8 +426,37 @@ def get_audio_duration(audio_path: Path) -> float:
 
 
 # ==============================================================================
-# 5. توليد القصة بمدة متغيرة (30 إلى 60 ثانية) ومنع التكرار
+# 5. الاتصال الذكي بـ Gemini API (يكتشف النماذج المتاحة تلقائياً بدون 404)
 # ==============================================================================
+def discover_gemini_models(api_key: str) -> list:
+    fallback_models = [
+        "models/gemini-flash-latest",
+        "models/gemini-2.5-flash",
+        "models/gemini-2.0-flash",
+        "models/gemini-pro-latest",
+    ]
+    try:
+        resp = requests.get(
+            f"https://generativelanguage.googleapis.com/v1beta/models?key={api_key}",
+            timeout=15
+        )
+        if resp.status_code == 200:
+            models = resp.json().get("models", [])
+            valid = []
+            for m in models:
+                name = m.get("name", "")
+                methods = m.get("supportedGenerationMethods", [])
+                if "generateContent" in methods and "gemini" in name.lower():
+                    if not any(x in name.lower() for x in ("image", "tts", "embedding", "aqa", "vision")):
+                        valid.append(name)
+            flash_first = sorted(valid, key=lambda n: (0 if "flash" in n.lower() else 1, n))
+            if flash_first:
+                return flash_first
+    except Exception:
+        pass
+    return fallback_models
+
+
 def generate_story(history: list) -> dict:
     now_iq = get_iraq_now()
     today_str = now_iq.strftime("%Y-%m-%d")
@@ -407,7 +474,7 @@ def generate_story(history: list) -> dict:
 
     if GEMINI_API_KEY:
         prompt = f"""
-أنت مخرج ومؤلف محتوى لفيديوهات Stickman عربية احترافية لصفحة ({PAGE_DISPLAY_NAME}) وفق منهجية متقن.
+أنت مخرج ومؤلف محتوى لفيديوهات Stickman عربية احترافية لصفحة ({PAGE_DISPLAY_NAME}).
 الوقت الحالي: فترة {slot_name} ({today_str}).
 التصنيف المطلوب لهذه الحلقة حصراً: {chosen_cat['name']}.
 قواعد التصنيف: {chosen_cat['rules']}
@@ -442,30 +509,35 @@ def generate_story(history: list) -> dict:
   ]
 }}
 """
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
+        candidate_models = discover_gemini_models(GEMINI_API_KEY)
         payload = {
             "contents": [{"parts": [{"text": prompt}]}],
             "generationConfig": {"temperature": 0.85, "responseMimeType": "application/json"}
         }
-        try:
-            resp = requests.post(url, json=payload, timeout=35)
-            resp.raise_for_status()
-            data = resp.json()
-            raw_text = data["candidates"][0]["content"]["parts"][0]["text"]
-            story = json.loads(raw_text)
 
-            if story.get("category") == "hadith_sahih":
-                src = story.get("hadith_source", "")
-                if not ("البخاري" in src or "مسلم" in src):
-                    raise ValueError(f"تم رفض حديث غير موثق من البخاري أو مسلم: {src}")
+        for model_name in candidate_models[:4]:
+            url = f"https://generativelanguage.googleapis.com/v1beta/{model_name}:generateContent?key={GEMINI_API_KEY}"
+            try:
+                resp = requests.post(url, json=payload, timeout=35)
+                if resp.status_code == 404:
+                    continue
+                resp.raise_for_status()
+                data = resp.json()
+                raw_text = data["candidates"][0]["content"]["parts"][0]["text"]
+                story = json.loads(raw_text)
 
-            if "scenes" in story and len(story["scenes"]) >= 4:
-                for sc in story["scenes"]:
-                    sc["spoken_text"] = sanitize_spoken_text(sc.get("spoken_text", ""))
-                print(f"[OK] تم توليد حلقة جديدة ({chosen_cat['name']}): {story.get('title')}")
-                return story
-        except Exception as e:
-            print(f"[WARN] تعذر التوليد عبر Gemini ({e}) — اختيار حلقة معتمدة غير مكررة.")
+                if story.get("category") == "hadith_sahih":
+                    src = story.get("hadith_source", "")
+                    if not ("البخاري" in src or "مسلم" in src):
+                        raise ValueError(f"تم رفض حديث غير موثق من البخاري أو مسلم: {src}")
+
+                if "scenes" in story and len(story["scenes"]) >= 4:
+                    for sc in story["scenes"]:
+                        sc["spoken_text"] = sanitize_spoken_text(sc.get("spoken_text", ""))
+                    print(f"[OK] تم توليد حلقة جديدة عبر {model_name} ({chosen_cat['name']}): {story.get('title')}")
+                    return story
+            except Exception as e:
+                print(f"[WARN] محاولة {model_name} لم تكتمل ({e})")
 
     unused_fallbacks = [
         st for st in FALLBACK_STORIES
@@ -474,6 +546,7 @@ def generate_story(history: list) -> dict:
     chosen_fb = random.choice(unused_fallbacks if unused_fallbacks else FALLBACK_STORIES)
     for sc in chosen_fb["scenes"]:
         sc["spoken_text"] = sanitize_spoken_text(sc.get("spoken_text", ""))
+    print(f"[INFO] اختيار حلقة معتمدة غير مكررة: {chosen_fb.get('title')}")
     return chosen_fb
 
 
@@ -564,7 +637,6 @@ def synthesize_voice_and_timing(story: dict) -> tuple:
 # 7. محرك رسم الخلفيات المضيئة + شخصية Stickman بلون ثابت وحركة ناعمة
 # ==============================================================================
 def draw_scene_background(draw: ImageDraw.ImageDraw, bg_type: str, t: float):
-    """جميع الخلفيات مضيئة ونظيفة لضمان ثبات لون شخصية Stickman دائماً."""
     ground_y = int(HEIGHT * 0.70)
 
     if bg_type == "distraction":
@@ -642,10 +714,9 @@ def draw_scene_background(draw: ImageDraw.ImageDraw, bg_type: str, t: float):
 
 def draw_stickman_rig(draw: ImageDraw.ImageDraw, cx: float, ground_y: float,
                       pose: str, expression: str, facing: int, t: float):
-    """شخصية Stickman بلون ثابت دائماً وحركة مفاصل سلسة ومتوازنة."""
-    stroke = (15, 23, 42)        # ثابت دائماً — لا يتغير مع الخلفية
-    head_fill = (255, 255, 255)  # ثابت دائماً
-    accent = (234, 88, 12)       # سمة التمييز الثابتة
+    stroke = (15, 23, 42)
+    head_fill = (255, 255, 255)
+    accent = (234, 88, 12)
     lw = 13
 
     ease_in = min(1.0, t / 0.45)
@@ -765,7 +836,6 @@ def draw_motion_graphics_captions(img: Image.Image, text: str, local_t: float,
                                   speech_dur: float, scene_dur: float,
                                   base_font: ImageFont.FreeTypeFont,
                                   zoom_font: ImageFont.FreeTypeFont):
-    """موشن جرافيك نظيف بدون صناديق ملونة: دخول وخروج سلس + تكبير (Zoom) للكلمة المنطوقة."""
     words = [w for w in text.split() if w.strip()]
     if not words:
         return
@@ -951,7 +1021,7 @@ def render_frames_and_video(story: dict, timing: list, full_audio: Path) -> Path
 
 
 # ==============================================================================
-# 10. بوابة فحص الجودة التلقائية قبل النشر (المرحلة 8 من دليل متقن)
+# 10. بوابة فحص الجودة التلقائية قبل النشر
 # ==============================================================================
 def run_quality_gate(video_path: Path, audio_path: Path, story: dict) -> bool:
     checks = []
