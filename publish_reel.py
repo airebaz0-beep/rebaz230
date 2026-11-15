@@ -1,1333 +1,770 @@
-import os
-import sys
-import re
-import json
-import math
-import wave
-import random
-import shutil
-import asyncio
-import textwrap
-import subprocess
-import requests
-import numpy as np
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""ستيك مان ريلز — نسخة مضغوطة، كل الوظائف، مجانية 100%.
+المتطلبات: pip install requests pillow edge-tts imageio-ffmpeg
+الأسرار: FB_PAGE_ID, FB_ACCESS_TOKEN  (اختياري: GEMINI_API_KEY/GROQ_API_KEY/OPENROUTER_API_KEY)
+."""
+import argparse, asyncio, json, math, os, re, shutil, subprocess, sys, tempfile
+from datetime import datetime, timezone
+from pathlib import Path
 from PIL import Image, ImageDraw, ImageFont, features
-import google.generativeai as genai
-import edge_tts
 
-# تثبيت المكتبات المطلوبة تلقائياً
-subprocess.run(
-    [sys.executable, "-m", "pip", "install", "-q", "arabic-reshaper", "python-bidi", "mutagen"],
-    check=False
-)
-
-HAS_RAQM = features.check("raqm")
-
-try:
-    import arabic_reshaper
-    from bidi.algorithm import get_display
-except ImportError:
-    arabic_reshaper = None
-    get_display = None
-
-FFMPEG_BIN = shutil.which("ffmpeg")
-if not FFMPEG_BIN:
-    subprocess.run([sys.executable, "-m", "pip", "install", "-q", "imageio-ffmpeg"], check=False)
-    import imageio_ffmpeg
-    FFMPEG_BIN = imageio_ffmpeg.get_ffmpeg_exe()
+E = os.environ.get
+W, H = int(E("REEL_WIDTH") or 720), int(E("REEL_HEIGHT") or 1280)
+FPS = int(E("REEL_FPS") or 24)
+LANG = (E("CONTENT_LANG") or "ar").lower()
+LANG_AR = LANG.startswith("ar")
+VOICE = E("TTS_VOICE") or "ar-IQ-BasselNeural"
+RATE = E("TTS_RATE") or "+8%"
+TOPIC = E("TOPIC") or ""
+OUT = Path(E("OUT_DIR") or tempfile.gettempdir() + "/reel")
+GK, GRK, ORK = E("GEMINI_API_KEY") or "", E("GROQ_API_KEY") or "", E("OPENROUTER_API_KEY") or ""
+GMODEL = E("GEMINI_MODEL") or "gemini-2.5-flash"
+FBT, FBP = E("FB_ACCESS_TOKEN") or "", E("FB_PAGE_ID") or ""
+GRAPH = E("GRAPH_VERSION") or "v21.0"
+RAQM = features.check("raqm")
+FF = None
 
 
-def select_random_font():
-    """البحث تلقائياً عن جميع الخطوط المرفوعة في المستودع واختيار خط عشوائي لكل ريلز"""
-    all_fonts = []
-    bold_or_regular_fonts = []
-    search_dirs = [".", "fonts"]
-
-    for folder in search_dirs:
-        if os.path.isdir(folder):
-            for fname in os.listdir(folder):
-                if fname.lower().endswith((".ttf", ".otf")):
-                    full_path = os.path.join(folder, fname)
-                    all_fonts.append(full_path)
-                    if "extralight" not in fname.lower() and "thin" not in fname.lower():
-                        bold_or_regular_fonts.append(full_path)
-
-    candidates = sorted(list(set(bold_or_regular_fonts or all_fonts)))
-    if candidates:
-        chosen = random.choice(candidates)
-        print(f"الخطوط المتوفرة ({len(candidates)}): {[os.path.basename(f) for f in candidates]}")
-        print(f"الخط المختار لهذا الريلز: {os.path.basename(chosen)}")
-        return chosen
-
-    fallback = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
-    print("تنبيه: لم يتم العثور على خطوط مرفوعة، تم استخدام الخط الاحتياطي.")
-    return fallback if os.path.exists(fallback) else None
+def log(m):
+    print(f"[{datetime.now(timezone.utc):%H:%M:%S}] {m}", flush=True)
 
 
-def shape_word(word):
-    """تهيئة الكلمة العربية للرسم الصحيح"""
-    if HAS_RAQM:
-        return word
-    if arabic_reshaper and get_display:
-        return get_display(arabic_reshaper.reshape(word))
-    return word
+# ───────────────────────── ffmpeg ─────────────────────────
+def ffmpeg():
+    global FF
+    if FF:
+        return FF
+    exe = shutil.which("ffmpeg")
+    if not exe:
+        try:
+            import imageio_ffmpeg
+            exe = imageio_ffmpeg.get_ffmpeg_exe()
+        except Exception:
+            sys.exit("ffmpeg غير موجود: sudo apt-get install -y ffmpeg  أو  pip install imageio-ffmpeg")
+    FF = exe
+    return exe
 
 
-def shape_multiline(text, max_chars=22):
-    """تقسيم وتهيئة النص متعدد الأسطر للغلاف"""
-    wrapped = textwrap.fill(text.strip(), width=max_chars)
-    if HAS_RAQM:
-        return wrapped
-    if arabic_reshaper and get_display:
-        return "\n".join(get_display(arabic_reshaper.reshape(line)) for line in wrapped.split("\n"))
-    return wrapped
+def duration(path):
+    p = subprocess.run([ffmpeg(), "-hide_banner", "-i", str(path)], capture_output=True, text=True)
+    m = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", p.stderr)
+    return (int(m[1]) * 3600 + int(m[2]) * 60 + float(m[3])) if m else 0.0
 
 
-def ease_out_back(t):
-    t = max(0.0, min(1.0, t))
-    c1 = 1.70158
-    c3 = c1 + 1.0
-    return 1.0 + c3 * ((t - 1.0) ** 3) + c1 * ((t - 1.0) ** 2)
+# ───────────────────────── خطوط (تنزيل تلقائي) ─────────────────────────
+FONT_DIR = Path(__file__).resolve().parent / "assets" / "fonts"
+FONT_URLS = {
+    "cairo.ttf": "https://github.com/google/fonts/raw/main/ofl/cairo/Cairo%5Bslnt%2Cwght%5D.ttf",
+    "noto_naskh.ttf": "https://github.com/google/fonts/raw/main/ofl/notonaskharabic/NotoNaskhArabic%5Bwght%5D.ttf",
+    "amiri.ttf": "https://github.com/google/fonts/raw/main/ofl/amiri/Amiri-Regular.ttf",
+}
+SYS_FONTS = ["/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+             "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+             "/usr/share/fonts/opentype/noto/NotoNaskhArabic-Regular.ttf",
+             "C:/Windows/Fonts/arial.ttf"]
+_FONTS = None
 
 
-def ease_out_cubic(t):
-    t = max(0.0, min(1.0, t))
-    return 1.0 - ((1.0 - t) ** 3)
-
-
-def get_audio_duration(audio_file):
-    try:
-        from mutagen.mp3 import MP3
-        return float(MP3(audio_file).info.length)
-    except Exception:
-        res = subprocess.run(
-            [FFMPEG_BIN, "-i", audio_file],
-            stderr=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            text=True
-        )
-        m = re.search(r"Duration:\s*(\d+):(\d+):(\d+\.\d+)", res.stderr)
-        if m:
-            h, mins, secs = map(float, m.groups())
-            return h * 3600 + mins * 60 + secs
-        return 3.5
-
-
-def analyze_audio_and_timings(audio_file, words, total_frames, duration, raw_boundaries):
-    """استخراج مستوى الصوت لحركة الفم + توقيت ظهور كل كلمة بدقة"""
-    try:
-        cmd = [
-            FFMPEG_BIN, "-i", audio_file,
-            "-f", "s16le", "-ac", "1", "-ar", "2000",
-            "-loglevel", "quiet", "-"
-        ]
-        raw = subprocess.check_output(cmd)
-        samples = np.frombuffer(raw, dtype=np.int16).astype(np.float32)
-    except Exception:
-        samples = np.array([], dtype=np.float32)
-
-    if len(samples) > 0:
-        chunks = np.array_split(np.abs(samples), total_frames)
-        levels = [float(np.mean(c)) if len(c) > 0 else 0.0 for c in chunks]
-        max_val = max(levels) if max(levels) > 0 else 1.0
-        envelope = [min(1.0, val / (max_val * 0.75)) for val in levels]
-
-        active_indices = [i for i, lvl in enumerate(envelope) if lvl > 0.12]
-        if active_indices:
-            speech_start = max(0.0, (active_indices[0] / total_frames) * duration - 0.05)
-            speech_end = min(duration, ((active_indices[-1] + 1) / total_frames) * duration + 0.05)
+def fonts():
+    global _FONTS
+    if _FONTS is not None:
+        return _FONTS
+    cache = Path(E("FONT_CACHE_DIR") or (Path.home() / ".cache" / "reel-fonts"))
+    _FONTS = {}
+    for name, url in FONT_URLS.items():
+        for d in (FONT_DIR, cache):
+            p = d / name
+            if p.exists() and p.stat().st_size > 10000:
+                _FONTS[name] = p
+                break
         else:
-            speech_start, speech_end = 0.05, max(0.2, duration - 0.05)
-    else:
-        envelope = [0.5] * total_frames
-        speech_start, speech_end = 0.05, max(0.2, duration - 0.05)
-
-    word_timings = []
-    if raw_boundaries and len(raw_boundaries) == len(words):
-        for idx, b in enumerate(raw_boundaries):
-            st = b["start"]
-            en = b["end"] if b["end"] > st else (
-                raw_boundaries[idx + 1]["start"] if idx + 1 < len(raw_boundaries) else speech_end
-            )
-            word_timings.append((st, max(st + 0.15, en)))
-    else:
-        weights = [max(2, len(w)) for w in words]
-        total_w = sum(weights) if sum(weights) > 0 else 1
-        span = max(0.25, speech_end - speech_start)
-        cursor = speech_start
-        for w_weight in weights:
-            w_dur = span * (w_weight / total_w)
-            word_timings.append((cursor, cursor + w_dur))
-            cursor += w_dur
-
-    return envelope, word_timings
+            try:
+                import requests
+                cache.mkdir(parents=True, exist_ok=True)
+                log(f"⬇️  تنزيل خط: {name}")
+                r = requests.get(url, timeout=60)
+                r.raise_for_status()
+                (cache / name).write_bytes(r.content)
+                if (cache / name).stat().st_size > 10000:
+                    _FONTS[name] = cache / name
+            except Exception as e:
+                log(f"⚠️ خط {name}: {str(e)[:80]}")
+    return _FONTS
 
 
-def generate_ambient_audio(scene_durations, output_wav="bg_audio.wav"):
-    """توليد موسيقى خلفية هادئة ومؤثر انتقال ناعم بين المشاهد"""
-    sr = 44100
-    total_dur = max(1.0, sum(scene_durations))
-    total_samples = int(total_dur * sr)
-    t = np.linspace(0, total_dur, total_samples, endpoint=False)
-
-    chords = [
-        [220.00, 261.63, 329.63],  # Am
-        [174.61, 220.00, 261.63],  # F
-        [130.81, 196.00, 261.63],  # C
-        [196.00, 246.94, 293.66],  # G
-    ]
-    audio = np.zeros(total_samples, dtype=np.float32)
-    chord_len = 4.0
-    chord_idx = (t // chord_len).astype(int) % len(chords)
-
-    for idx_c, freqs in enumerate(chords):
-        mask = (chord_idx == idx_c)
-        if np.any(mask):
-            t_seg = t[mask]
-            pad = sum(np.sin(2 * np.pi * f * t_seg) for f in freqs) / len(freqs)
-            local_t = t_seg % chord_len
-            env = np.minimum(1.0, local_t / 0.35) * np.minimum(1.0, (chord_len - local_t) / 0.35)
-            audio[mask] += 0.042 * pad * env
-
-    cursor = 0.0
-    for s_idx, d in enumerate(scene_durations):
-        if s_idx > 0:
-            start_sample = int(cursor * sr)
-            pop_len = int(0.09 * sr)
-            end_sample = min(total_samples, start_sample + pop_len)
-            n_s = end_sample - start_sample
-            if n_s > 0:
-                tp = np.linspace(0, n_s / sr, n_s, endpoint=False)
-                freq_sweep = 320.0 + 480.0 * (tp / 0.09)
-                pop_wave = np.sin(2 * np.pi * freq_sweep * tp) * np.exp(-tp * 38.0)
-                audio[start_sample:end_sample] += 0.14 * pop_wave
-        cursor += d
-
-    audio_int16 = np.clip(audio * 32767.0, -32768, 32767).astype(np.int16)
-    with wave.open(output_wav, "wb") as wf:
-        wf.setnchannels(1)
-        wf.setsampwidth(2)
-        wf.setframerate(sr)
-        wf.writeframes(audio_int16.tobytes())
-    return output_wav
-
-
-# 1. إعداد المفاتيح وجلب هوية الصفحة
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-FB_ACCESS_TOKEN = os.getenv("FB_ACCESS_TOKEN")
-FB_PAGE_ID = os.getenv("FB_PAGE_ID")
-
-genai.configure(api_key=GEMINI_API_KEY, transport="rest")
-
-
-def get_page_name():
-    if not FB_ACCESS_TOKEN or not FB_PAGE_ID:
-        return "إضاءات ومعرفة"
-    try:
-        res = requests.get(
-            f"https://graph.facebook.com/v20.0/{FB_PAGE_ID}",
-            params={"fields": "name", "access_token": FB_ACCESS_TOKEN},
-            timeout=10
-        ).json()
-        name = res.get("name", "").strip()
-        if name:
-            print(f"اسم الصفحة المعتمد: {name}")
-            return name
-    except Exception as e:
-        print("تعذر جلب اسم الصفحة:", e)
-    return "إضاءات ومعرفة"
-
-
-def load_topic_history(history_file="topics_history.txt", limit=30):
-    if not os.path.exists(history_file):
-        return []
-    with open(history_file, "r", encoding="utf-8") as f:
-        lines = [line.strip() for line in f if line.strip()]
-    return lines[-limit:]
-
-
-def save_topic_history(title, history_file="topics_history.txt"):
-    clean_title = title.strip()
-    if not clean_title:
-        return
-    existing = load_topic_history(history_file, limit=120)
-    if clean_title not in existing:
-        with open(history_file, "a", encoding="utf-8") as f:
-            f.write(clean_title + "\n")
-
-
-# 2. توليد السيناريو بتنوع شامل (حديث، معلومات، مقولات، نصائح دينية ومالية ودنيوية)
-async def generate_script():
-    print("جاري توليد السيناريو والمشاهد البصرية...")
-    outro_scene = {
-        "text": "تابعوا الصفحة للمزيد من المعلومات",
-        "pose": "FOLLOW",
-        "visual": "FOLLOW_CARD"
-    }
-
-    length_profiles = [
-        {
-            "name": "سريع (18-22 ثانية)",
-            "scenes_count": "4",
-            "words_per_scene": "4 إلى 6 كلمات",
-            "style_instruction": "اجعل الطرح سريعاً ومباشراً ومكثف الفائدة."
-        },
-        {
-            "name": "متوسط (28-35 ثانية)",
-            "scenes_count": "6",
-            "words_per_scene": "5 إلى 8 كلمات",
-            "style_instruction": "اشرح الفكرة بوضوح وعمق مع ذكر السبب أو الفائدة العملية."
-        },
-        {
-            "name": "مفصّل (38-45 ثانية)",
-            "scenes_count": "8",
-            "words_per_scene": "6 إلى 9 كلمات",
-            "style_instruction": "قدّم شرحاً وافياً وممتعاً بأسلوب قصصي أو خطوات عملية متتالية."
-        }
-    ]
-    chosen_len = random.choices(length_profiles, weights=[3, 5, 2], k=1)[0]
-
-    content_categories = [
-        {
-            "category": "شرح حديث نبوي شريف",
-            "instruction": (
-                "اذكر حديثاً نبوياً صحيحاً وقصيراً ومشهوراً بدقة، ثم اشرح معناه العميق وكيف نطبقه في حياتنا اليومية بأسلوب مؤثر وواضح."
-            ),
-            "hashtags": "#أحاديث #السنة_النبوية #تذكير #إسلاميات",
-            "preferred_visuals": "BOOK_LIGHT, HEART_GLOW, COMPASS_LIFE, IDEA_BULB"
-        },
-        {
-            "category": "معلومات عامة وعلمية مذهلة",
-            "instruction": (
-                "قدّم معلومة غريبة ومدهشة في العلوم، التاريخ، الفضاء، جسم الإنسان، أو التكنولوجيا بأسلوب يثير الفضول."
-            ),
-            "hashtags": "#معلومات #هل_تعلم #ثقافة #حقائق",
-            "preferred_visuals": "GLOBE, AI_BRAIN, MAGNIFIER, ROCKET, IDEA_BULB"
-        },
-        {
-            "category": "مقولات وحكم مفيدة",
-            "instruction": (
-                "اختر مقولة حكيمة أو قاعدة ذهبية ملهمة من تجارب الحكماء، واشرح مغزاها وكيف تغيّر نظرتنا للحياة."
-            ),
-            "hashtags": "#حكم #مقولات #تطوير_الذات #اقتباسات",
-            "preferred_visuals": "BOOK_LIGHT, COMPASS_LIFE, IDEA_BULB, CHART_UP"
-        },
-        {
-            "category": "نصائح دينية وإيمانية",
-            "instruction": (
-                "قدّم نصيحة إيمانية وروحية لطيفة حول ذكر الله، الطمأنينة، بر الوالدين، الصدقة، أو إصلاح القلب بأسلوب دافئ ومحبب."
-            ),
-            "hashtags": "#نصائح_دينية #تذكير #طمأنينة #ذكر",
-            "preferred_visuals": "HEART_GLOW, BOOK_LIGHT, SECURITY, CLOCK"
-        },
-        {
-            "category": "نصائح مالية وإدارة الأموال",
-            "instruction": (
-                "قدّم نصيحة مالية عملية حول الادخار الذكي، تجنب التبذير، بناء مصدر دخل إضافي، أو العقلية المالية الناجحة."
-            ),
-            "hashtags": "#نصائح_مالية #إدارة_المال #نجاح #ادخار",
-            "preferred_visuals": "MONEY_GROWTH, CHART_UP, SECURITY, CLOCK"
-        },
-        {
-            "category": "نصائح دنيوية وتطوير الذات",
-            "instruction": (
-                "قدّم نصيحة حياتية ذكية في فن التعامل مع الناس، بناء العادات الناجحة، الحفاظ على الطاقة النفسية، أو تنظيم الوقت."
-            ),
-            "hashtags": "#نصائح_حياتية #تطوير_الذات #نجاح #حياة",
-            "preferred_visuals": "COMPASS_LIFE, ROCKET, CLOCK, BATTERY, SECURITY"
-        }
-    ]
-    chosen_cat = random.choice(content_categories)
-
-    past_topics = load_topic_history()
-    avoid_clause = ""
-    if past_topics:
-        avoid_clause = f"\nمهم جداً: لا تكرر أياً من هذه المواضيع المنشورة سابقاً: {', '.join(past_topics)}."
-
-    print(f"القسم المختار: {chosen_cat['category']} | النمط: {chosen_len['name']}")
-
-    prompt = f"""
-    اكتب سيناريو فيديو ريلز (Reel) شيق ومفيد جداً باللغة العربية الفصحى البسيطة والواضحة في قسم: ({chosen_cat['category']}).
-    التوجيه الخاص بالمحتوى: {chosen_cat['instruction']}
-    {chosen_len['style_instruction']}{avoid_clause}
-    يجب أن يكون النص مقسماً إلى {chosen_len['scenes_count']} مشاهد بالضبط (كل مشهد جملة واحدة من {chosen_len['words_per_scene']}).
-    مهم: اجعل المشهد الأخير في قائمتك عبارة عن سؤال تفاعلي قصير يشجع المشاهدين على التعليق حول الموضوع (مع اختيار pose="QUESTION" و visual="COMMENT_BUBBLE")، ولا تكتب دعوة لمتابعة الصفحة لأنها ستضاف تلقائياً.
-    
-    لكل مشهد، اختر:
-    1) "pose" من القائمة: [WELCOME, POINTING, THINKING, EXPLAINING, WARNING, SUCCESS, QUESTION]
-    2) "visual" من القائمة (يفضل التركيز على: {chosen_cat['preferred_visuals']}):
-       [BOOK_LIGHT, HEART_GLOW, MONEY_GROWTH, COMPASS_LIFE, BATTERY, PHONE_APPS, AI_BRAIN, ROCKET, SECURITY, CHART_UP, WARNING_SIGN, CLOCK, GLOBE, WIFI, MAGNIFIER, IDEA_BULB, COMMENT_BUBBLE]
-    
-    أرجع النتيجة بصيغة JSON فقط بدون أي كلام إضافي:
-    {{
-      "title": "عنوان غلاف قصير وجذاب من 3 إلى 5 كلمات",
-      "caption": "وصف الريلز مع هاشتاغات مناسبة مثل {chosen_cat['hashtags']}",
-      "scenes": [
-        {{"text": "الجملة الأولى هنا", "pose": "WELCOME", "visual": "BOOK_LIGHT"}},
-        {{"text": "ما رأيك بهذا المعنى؟ شاركنا في التعليقات!", "pose": "QUESTION", "visual": "COMMENT_BUBBLE"}}
-      ]
-    }}
-    """
-    try:
-        model = None
-        for m in genai.list_models():
-            if (
-                "generateContent" in m.supported_generation_methods
-                and "flash" in m.name
-                and "image" not in m.name
-                and "tts" not in m.name
-            ):
+def font(size, bold=True):
+    for name, p in fonts().items():
+        try:
+            f = ImageFont.truetype(str(p), size)
+            if name == "cairo.ttf" and bold:
                 try:
-                    candidate = genai.GenerativeModel(m.name)
-                    candidate.generate_content("1", request_options={"timeout": 15})
-                    model = candidate
-                    print(f"تم الاتصال بالنموذج: {m.name}")
-                    break
+                    f.set_variation_by_axes([0, 700])
                 except Exception:
-                    continue
-
-        if model:
-            response = model.generate_content(prompt, request_options={"timeout": 25})
-            text = response.text.strip()
-            if "```json" in text:
-                text = text.split("```json")[1].split("```")[0].strip()
-            elif "```" in text:
-                text = text.split("```")[1].split("```")[0].strip()
-            data = json.loads(text)
-            if "scenes" in data and len(data["scenes"]) > 0:
-                if "تابع" in data["scenes"][-1].get("text", ""):
-                    data["scenes"].pop()
-                data["scenes"].append(outro_scene)
-                save_topic_history(data.get("title", ""))
-                return data
-    except Exception as e:
-        print("تم استخدام السيناريو الاحتياطي بسبب:", e)
-
-    fallback_scripts = [
-        {
-            "title": "قاعدة الادخار الذكية!",
-            "caption": "كيف تحافظ على راتبك وتبني أمانك المالي؟ 💰📈 #نصائح_مالية #إدارة_المال #نجاح",
-            "scenes": [
-                {"text": "أكبر خطأ مالي يقع فيه الأغلبية كل شهر", "pose": "WARNING", "visual": "WARNING_SIGN"},
-                {"text": "هو إنفاق الراتب أولاً ثم ادخار ما يتبقى", "pose": "EXPLAINING", "visual": "MONEY_GROWTH"},
-                {"text": "القاعدة الذهبية تقول ادخر لنفسك أولاً", "pose": "POINTING", "visual": "CHART_UP"},
-                {"text": "استقطع عشرة بالمئة فور استلام دخلك مباشرة", "pose": "SUCCESS", "visual": "SECURITY"},
-                {"text": "كم نسبة ادخارك الشهرية؟ شاركنا تجربتك بالتعليقات!", "pose": "QUESTION", "visual": "COMMENT_BUBBLE"},
-                outro_scene
-            ]
-        },
-        {
-            "title": "كنز من كنوز الجنة!",
-            "caption": "حديث نبوي عظيم يملأ قلبك بالسكينة والقوة 🤍✨ #أحاديث #تذكير #إسلاميات",
-            "scenes": [
-                {"text": "قال رسول الله صلى الله عليه وسلم", "pose": "WELCOME", "visual": "BOOK_LIGHT"},
-                {"text": "ألا أدلك على كنز من كنوز الجنة", "pose": "POINTING", "visual": "HEART_GLOW"},
-                {"text": "لا حول ولا قوة إلا بالله", "pose": "EXPLAINING", "visual": "BOOK_LIGHT"},
-                {"text": "كلمة عظيمة تفتح بها الأبواب المغلقة وتزيل الهم", "pose": "SUCCESS", "visual": "COMPASS_LIFE"},
-                {"text": "هل تداوم على هذا الذكر يومياً؟ اكتب لنا بالتعليقات!", "pose": "QUESTION", "visual": "COMMENT_BUBBLE"},
-                outro_scene
-            ]
-        },
-        {
-            "title": "حكمة تغيّر حياتك!",
-            "caption": "لا تستهين بالخطوات الصغيرة المستمرة 🌟🧭 #حكم #تطوير_الذات #نجاح",
-            "scenes": [
-                {"text": "قليل دائم خير من كثير منقطع", "pose": "WELCOME", "visual": "BOOK_LIGHT"},
-                {"text": "النجاح الكبير لا يأتي من قفزة واحدة مفاجئة", "pose": "THINKING", "visual": "COMPASS_LIFE"},
-                {"text": "بل من عادات بسيطة تكررها كل يوم بإصرار", "pose": "POINTING", "visual": "CLOCK"},
-                {"text": "ابدأ اليوم ولو بعشر دقائق وستدهشك النتيجة", "pose": "SUCCESS", "visual": "ROCKET"},
-                {"text": "ما العادة التي تتمنى الالتزام بها؟ شاركنا بالتعليقات!", "pose": "QUESTION", "visual": "COMMENT_BUBBLE"},
-                outro_scene
-            ]
-        }
-    ]
-    return random.choice(fallback_scripts)
+                    pass
+            return f
+        except Exception:
+            continue
+    for p in SYS_FONTS:
+        if Path(p).exists():
+            try:
+                return ImageFont.truetype(p, size)
+            except Exception:
+                continue
+    return ImageFont.load_default()
 
 
-def draw_joint(draw, pt, radius, color):
-    x, y = int(pt[0]), int(pt[1])
-    r = max(1, int(radius))
-    draw.ellipse([(x - r, y - r), (x + r, y + r)], fill=color)
+# ───────────────────────── نص عربي ─────────────────────────
+def is_rtl(t):
+    return any("\u0600" <= c <= "\u06FF" for c in t)
 
 
-# 3. رسم الجزيئات الضوئية المتحركة بالخلفية
-PARTICLES = [
-    {
-        "x": (i * 173 + 60) % 1080,
-        "y": (i * 293 + 110) % 1920,
-        "r": 3 + (i % 4),
-        "speed_y": 1.4 + (i % 5) * 0.45,
-        "phase": i * 0.7
-    }
-    for i in range(28)
+def shape(t):
+    if RAQM or not LANG_AR:
+        return t
+    try:
+        import arabic_reshaper
+        from bidi.algorithm import get_display
+        return get_display(arabic_reshaper.reshape(t))
+    except Exception:
+        return t
+
+
+def kw(t):
+    return {"direction": "rtl"} if (RAQM and is_rtl(t)) else {}
+
+
+def measure(f, t):
+    try:
+        return f.getlength(shape(t), **kw(t))
+    except TypeError:
+        return f.getlength(shape(t))
+
+
+def dtext(d, xy, t, f, fill, anchor="la"):
+    try:
+        d.text(xy, shape(t), font=f, fill=fill, anchor=anchor, **kw(t))
+    except TypeError:
+        d.text(xy, shape(t), font=f, fill=fill, anchor=anchor)
+
+
+def wrap(t, f, maxw, maxl=3):
+    words, lines, cur = t.split(), [], ""
+    for w in words:
+        trial = f"{cur} {w}".strip()
+        if measure(f, trial) <= maxw or not cur:
+            cur = trial
+        else:
+            lines.append(cur)
+            cur = w
+            if len(lines) == maxl:
+                break
+    if cur and len(lines) < maxl:
+        lines.append(cur)
+    if len(lines) == maxl and measure(f, " ".join(words)) > maxw:
+        last = lines[-1]
+        while last and measure(f, last + "…") > maxw:
+            last = last[:-1]
+        lines[-1] = last + "…"
+    return lines
+
+
+# ───────────────────────── عناصر تعبّر عن معنى الجملة ─────────────────────────
+PROPS = {
+    "clock": ["وقت", "ساعة", "ساعات", "دقيقة", "يوم", "أيام", "سنة", "سنين", "شهر", "شهور", "ليل", "time", "hour", "day", "year"],
+    "coins": ["فلوس", "مال", "غني", "فقير", "راتب", "دخل", "money", "rich", "salary"],
+    "plant": ["صبر", "زرع", "بذرة", "جذور", "نمو", "تنمو", "تسقي", "شجرة", "استمر", "استمرار", "plant", "seed", "roots", "patience", "grow"],
+    "mountain": ["هدف", "قمة", "طموح", "تحدي", "تحدٍّ", "goal", "mountain", "peak", "challenge"],
+    "book": ["تعلم", "تعلّم", "درس", "اقرأ", "قراءة", "معرفة", "عقل", "learn", "book", "read"],
+    "shadow": ["خوف", "خوفك", "رعب", "قلق", "خايف", "تخاف", "fear", "afraid", "scared"],
+    "steps": ["خطوة", "خطوات", "طريق", "بداية", "ابدأ", "إبدأ", "step", "start", "path"],
+    "hourglass": ["انتظار", "انتظر", "تنتظر", "مؤجل", "بعدين", "wait", "waiting", "later"],
+    "fire": ["شغف", "حماس", "طاقة", "حلم", "أحلام", "إصرار", "passion", "fire", "dream"],
+    "heart": ["حب", "قلب", "سعادة", "سلام", "راحة", "love", "heart", "peace"],
+    "wall": ["فشل", "غلط", "خسارة", "كسر", "عقبة", "حاجز", "fail", "mistake", "loss", "obstacle"],
+    "trophy": ["نجاح", "فوز", "إنجاز", "أنجز", "وصلت", "success", "win", "achieve", "trophy"],
+    "star": ["مثالي", "الأفضل", "مميز", "تفوّق", "perfect", "best", "star"],
+    "mirror": ["مقارنة", "تقارن", "المقارنة", "نفسك", "مرآة", "قارن", "compare", "yourself", "mirror"],
+}
+FLAT = None
+
+
+def detect_prop(text, explicit=""):
+    if explicit in PROPS:
+        return explicit
+    low = text.lower()
+    best, ln = "none", 0
+    for k, ws in PROPS.items():
+        for w in ws:
+            if w in low and len(w) > ln:
+                best, ln = k, len(w)
+    return best
+
+
+def is_kw(word):
+    global FLAT
+    if FLAT is None:
+        FLAT = sorted({w for ws in PROPS.values() for w in ws}, key=len, reverse=True)
+    c = re.sub(r"[^\w\u0600-\u06FF]", "", word).lower()
+    if not c:
+        return False
+    if c in FLAT or (c.startswith("ال") and c[2:] in FLAT):
+        return True
+    return any(len(k) >= 3 and c.startswith(k) and len(c) - len(k) <= 3 for k in FLAT)
+
+
+def rich_line(d, cx, y, line, f, base, acc):
+    words = line.split()
+    if not words:
+        return
+    sp = measure(f, " ")
+    ws = [measure(f, w) for w in words]
+    total = sum(ws) + sp * (len(words) - 1)
+    if is_rtl(line):
+        x = cx + total / 2
+        for w, ww in zip(words, ws):
+            dtext(d, (int(x), y), w, f, acc if is_kw(w) else base, "ra")
+            x -= ww + sp
+    else:
+        x = cx - total / 2
+        for w, ww in zip(words, ws):
+            dtext(d, (int(x), y), w, f, acc if is_kw(w) else base, "la")
+            x += ww + sp
+
+
+def draw_prop(d, key, cx, cy, s, t, col, acc, lw):
+    if not key or key == "none":
+        return
+    p = min(1.0, t / 0.45) ** 0.6
+    s *= 0.55 + 0.45 * p
+    cy = cy + math.sin(t * 1.7) * s * 0.06
+    a = int(255 * p)
+    w = max(2, int(lw * 0.75))
+    C = lambda c: (c[0], c[1], c[2], a)
+    flip = math.sin(t * 9) * s * 0.05
+    if key == "dots":
+        bw, bh = s * 0.62, s * 0.36
+        d.rounded_rectangle([cx - bw / 2, cy - bh / 2, cx + bw / 2, cy + bh / 2], radius=bh * 0.45, outline=C(col), width=w)
+        d.polygon([(cx - bw * 0.22, cy + bh * 0.48), (cx - bw * 0.04, cy + bh * 0.48), (cx - bw * 0.22, cy + bh * 0.86)], fill=C(col))
+        for k in range(3):
+            rr = max(2.0, s * 0.045)
+            dx = (k - 1) * bw * 0.26
+            al = int(120 + 135 * abs(math.sin(t * 2.6 - k * 0.7)))
+            d.ellipse([cx + dx - rr, cy - rr, cx + dx + rr, cy + rr], fill=(col[0], col[1], col[2], min(a, al)))
+    elif key == "clock":
+        r = s * 0.5
+        d.ellipse([cx - r, cy - r, cx + r, cy + r], outline=C(col), width=w)
+        for k in range(12):
+            an = k * math.pi / 6
+            d.line([(cx + math.sin(an) * r * 0.84, cy - math.cos(an) * r * 0.84),
+                    (cx + math.sin(an) * r * 0.95, cy - math.cos(an) * r * 0.95)], fill=C(acc), width=max(1, w // 2))
+        d.line([(cx, cy), (cx, cy - r * 0.55)], fill=C(col), width=w)
+        d.line([(cx, cy), (cx + r * 0.42, cy + r * 0.12)], fill=C(col), width=w)
+    elif key == "coins":
+        for i in range(3):
+            yy = cy + s * 0.28 - i * s * 0.22
+            d.ellipse([cx - s * 0.3, yy - s * 0.12, cx + s * 0.3, yy + s * 0.12], outline=C(acc if i == 2 else col), width=w)
+    elif key == "plant":
+        def leaf(x0, y0, an, L, Wd):
+            q = []
+            for i in range(13):
+                u = i / 12
+                bx, by = x0 + math.cos(an) * L * u, y0 - math.sin(an) * L * u
+                ww = Wd * math.sin(math.pi * u)
+                q.append((bx - math.sin(an) * ww, by - math.cos(an) * ww))
+            for i in range(12, -1, -1):
+                u = i / 12
+                bx, by = x0 + math.cos(an) * L * u, y0 - math.sin(an) * L * u
+                ww = Wd * math.sin(math.pi * u)
+                q.append((bx + math.sin(an) * ww, by + math.cos(an) * ww))
+            return q
+        by = cy + s * 0.5
+        top = (cx + s * 0.05 + flip * 0.4, cy - s * 0.32)
+        d.line([(cx, by), (cx + s * 0.02, cy + s * 0.08), top], fill=C(col), width=w, joint="curve")
+        for bx, yy2, an, L in ((cx + s * 0.01, cy + s * 0.14, 0.62, s * 0.38), (cx + s * 0.03, cy + s * 0.02, math.pi - 0.62, s * 0.34)):
+            d.polygon(leaf(bx, yy2, an, L, s * 0.10), fill=(acc[0], acc[1], acc[2], int(46 * p)), outline=C(acc))
+        br = s * 0.09
+        d.ellipse([top[0] - br, top[1] - br, top[0] + br, top[1] + br], outline=C(acc), width=w)
+        d.line([(cx - s * 0.42, by), (cx + s * 0.42, by)], fill=C(col), width=w)
+    elif key == "mountain":
+        d.line([(cx - s * 0.6, cy + s * 0.4), (cx - s * 0.18, cy - s * 0.35), (cx + s * 0.05, cy + s * 0.02),
+                (cx + s * 0.22, cy - s * 0.25), (cx + s * 0.6, cy + s * 0.4)], fill=C(col), width=w, joint="curve")
+        d.line([(cx - s * 0.18, cy - s * 0.35), (cx - s * 0.18, cy - s * 0.57)], fill=C(col), width=w)
+        d.polygon([(cx - s * 0.18, cy - s * 0.57), (cx + s * 0.04, cy - s * 0.5), (cx - s * 0.18, cy - s * 0.43)], fill=C(acc))
+    elif key == "book":
+        d.line([(cx, cy - s * 0.32), (cx - s * 0.45, cy - s * 0.4), (cx - s * 0.45, cy + s * 0.36), (cx, cy + s * 0.44)], fill=C(col), width=w, joint="curve")
+        d.line([(cx, cy - s * 0.32), (cx + s * 0.45, cy - s * 0.4), (cx + s * 0.45, cy + s * 0.36), (cx, cy + s * 0.44)], fill=C(col), width=w, joint="curve")
+        d.line([(cx, cy - s * 0.32), (cx, cy + s * 0.44)], fill=C(acc), width=w)
+    elif key == "shadow":
+        d.ellipse([cx - s * 0.35, cy - s * 0.15, cx + s * 0.35, cy + s * 0.45], fill=(0, 0, 0, int(150 * p)))
+        for k in (-1, 1):
+            d.ellipse([cx + k * s * 0.12 - s * 0.09, cy - s * 0.44, cx + k * s * 0.12 + s * 0.09, cy - s * 0.26], fill=(0, 0, 0, int(150 * p)))
+            er = s * 0.045
+            d.ellipse([cx + k * s * 0.13 - er, cy + s * 0.02 - er, cx + k * s * 0.13 + er, cy + s * 0.02 + er], fill=(255, 255, 255, a))
+    elif key == "steps":
+        for i in range(3):
+            x0 = cx - s * 0.5 + i * s * 0.33
+            top = cy + s * 0.35 - i * s * 0.26
+            d.rectangle([x0, top, x0 + s * 0.33, cy + s * 0.42], outline=C(col), width=w)
+        d.line([(cx + s * 0.02, cy - s * 0.42), (cx + s * 0.36, cy - s * 0.42)], fill=C(acc), width=w)
+        d.polygon([(cx + s * 0.44, cy - s * 0.42), (cx + s * 0.30, cy - s * 0.5), (cx + s * 0.30, cy - s * 0.34)], fill=C(acc))
+    elif key == "hourglass":
+        d.line([(cx - s * 0.34, cy - s * 0.45), (cx + s * 0.34, cy - s * 0.45)], fill=C(col), width=w)
+        d.line([(cx - s * 0.34, cy + s * 0.45), (cx + s * 0.34, cy + s * 0.45)], fill=C(col), width=w)
+        d.line([(cx - s * 0.3, cy - s * 0.45), (cx, cy), (cx - s * 0.3, cy + s * 0.45)], fill=C(col), width=w, joint="curve")
+        d.line([(cx + s * 0.3, cy - s * 0.45), (cx, cy), (cx + s * 0.3, cy + s * 0.45)], fill=C(col), width=w, joint="curve")
+        sd = s * 0.16 * (0.4 + 0.6 * ((t * 0.5) % 1.0))
+        d.polygon([(cx - sd, cy + s * 0.45), (cx + sd, cy + s * 0.45), (cx, cy + s * 0.45 - sd)], fill=C(acc))
+    elif key == "fire":
+        def flame(top, bot, wd):
+            q, N = [], 18
+            for i in list(range(N + 1)) + list(range(N, -1, -1)):
+                u = i / N
+                xo = wd * math.sin(math.pi * 0.88 * (u ** 1.7)) + flip * (1 - u)
+                q.append((cx + xo, top + (bot - top) * u))
+            return q
+        top, bot = cy - s * 0.55, cy + s * 0.42
+        d.polygon(flame(top, bot, s * 0.3), fill=(acc[0], acc[1], acc[2], int(42 * p)), outline=C(acc))
+        for k in range(3):
+            rr = max(2.0, s * 0.035)
+            ux, uy = (-1) ** k * s * (0.34 + 0.08 * k), cy - s * (0.48 + 0.16 * k) + math.sin(t * 6 + k) * s * 0.04
+            d.ellipse([cx + ux - rr, uy - rr, cx + ux + rr, uy + rr], fill=(acc[0], acc[1], acc[2], int(170 * p)))
+    elif key == "heart":
+        rr = s * 0.42 * (1 + 0.06 * math.sin(t * 6))
+        d.arc([cx - rr, cy - rr, cx, cy], 180, 360, fill=C(acc), width=w)
+        d.arc([cx, cy - rr, cx + rr, cy], 180, 360, fill=C(acc), width=w)
+        d.line([(cx - rr, cy - rr * 0.45), (cx, cy + rr * 0.7), (cx + rr, cy - rr * 0.45)], fill=C(acc), width=w, joint="curve")
+    elif key == "wall":
+        bw, bh = s * 0.28, s * 0.18
+        for row in range(3):
+            off = bw / 2 if row % 2 else 0
+            for k in range(3):
+                x0, y0 = cx - s * 0.42 + k * bw + off, cy - s * 0.3 + row * bh
+                d.rectangle([x0, y0, x0 + bw * 0.92, y0 + bh * 0.88], outline=C(col), width=w)
+        d.line([(cx - s * 0.05, cy - s * 0.34), (cx + s * 0.06, cy - s * 0.02), (cx - s * 0.02, cy + s * 0.1), (cx + s * 0.1, cy + s * 0.34)], fill=C(acc), width=w, joint="curve")
+    elif key == "trophy":
+        ct, cb = cy - s * 0.34, cy + s * 0.1
+        d.arc([cx - s * 0.26, ct, cx + s * 0.26, cb], 0, 180, fill=C(acc), width=w)
+        d.line([(cx - s * 0.26, ct), (cx + s * 0.26, ct)], fill=C(acc), width=w)
+        d.arc([cx - s * 0.5, ct + s * 0.02, cx - s * 0.18, ct + s * 0.34], 90, 270, fill=C(col), width=w)
+        d.arc([cx + s * 0.18, ct + s * 0.02, cx + s * 0.5, ct + s * 0.34], 270, 90, fill=C(col), width=w)
+        d.line([(cx, cb), (cx, cy + s * 0.3)], fill=C(col), width=w)
+        d.line([(cx - s * 0.18, cy + s * 0.3), (cx + s * 0.18, cy + s * 0.3)], fill=C(col), width=w)
+        d.line([(cx - s * 0.26, cy + s * 0.4), (cx + s * 0.26, cy + s * 0.4)], fill=C(col), width=w)
+    elif key == "star":
+        q = []
+        for i in range(10):
+            an = -math.pi / 2 + i * math.pi / 5
+            rr = s * 0.45 if i % 2 == 0 else s * 0.19
+            q.append((cx + math.cos(an) * rr, cy + math.sin(an) * rr))
+        d.polygon(q, outline=C(acc))
+        d.line(q + [q[0]], fill=C(acc), width=w, joint="curve")
+    elif key == "mirror":
+        mw, mh = s * 0.52, s * 0.74
+        box = [cx - mw / 2, cy - mh / 2, cx + mw / 2, cy + mh / 2]
+        d.rounded_rectangle(box, radius=s * 0.12, outline=C(acc), width=w)
+        hr = s * 0.11
+        d.ellipse([cx - hr, cy - s * 0.16 - hr, cx + hr, cy - s * 0.16 + hr], outline=C(col), width=w)
+        d.line([(cx, cy - s * 0.05), (cx, cy + s * 0.18)], fill=C(col), width=w)
+
+
+# ───────────────────────── ستيك مان ─────────────────────────
+def stickman(d, fx, fy, s, mood, t, col, lw):
+    hr, leg, tor, arm = s * 0.135, s * 0.40, s * 0.32, s * 0.30
+    ar, al = 0.26, -0.26
+    lr, ll = 0.20, -0.20
+    lean = bounce = 0.0
+    if mood == "walk":
+        sw = math.sin(t * 2.6)
+        lr, ll, ar, al = 0.30 * sw, -0.30 * sw, -0.35 * sw, 0.35 * sw
+        bounce = -abs(sw) * s * 0.015
+    elif mood == "run":
+        sw = math.sin(t * 6.0)
+        lr, ll, ar, al = 0.62 * sw, -0.62 * sw, -0.62 * sw, 0.62 * sw
+        lean, bounce = s * 0.05, -abs(sw) * s * 0.03
+    elif mood == "talk":
+        ar, al, lr, ll = 0.95 + math.sin(t * 5) * 0.22, -0.30, 0.20, -0.20
+    elif mood == "point":
+        ar, al, lr, ll = 1.55, -0.26, 0.18, -0.18
+    elif mood == "think":
+        ar, al, lr, ll = 0.55 + math.sin(t * 2) * 0.08, -0.22, 0.15, -0.15
+        lean = -s * 0.012
+    elif mood == "sad":
+        ar, al, lr, ll = 0.10, -0.10, 0.12, -0.12
+        lean = -s * 0.02
+    elif mood == "happy":
+        ar = 1.95 + math.sin(t * 7) * 0.14
+        al = -ar
+        bounce, lr, ll = -abs(math.sin(t * 4.2)) * s * 0.035, 0.18, -0.18
+    elif mood == "jump":
+        jp = (math.sin(t * 3) + 1) / 2
+        bounce, ar, al, lr, ll = -jp * s * 0.16, 2.05, -2.05, 0.34, -0.34
+    hip = (fx + int(lean * 0.5), int(fy + bounce) - int(leg))
+    neck = (hip[0] + int(lean), hip[1] - int(tor))
+    hc = (neck[0] + int(lean * 0.5), neck[1] - int(hr * 0.95))
+    d.line([hip, neck], fill=col, width=lw, joint="curve")
+    d.ellipse([hc[0] - hr, hc[1] - hr, hc[0] + hr, hc[1] + hr], outline=col, width=lw)
+    er = max(2.0, hr * 0.15)
+    for ex in (-hr * 0.32, hr * 0.32):
+        d.ellipse([hc[0] + ex - er, hc[1] - hr * 0.16 - er, hc[0] + ex + er, hc[1] - hr * 0.16 + er], fill=col)
+    my, mw = hc[1] + hr * 0.40, hr * 0.45
+    if mood in ("happy", "jump", "run"):
+        d.arc([hc[0] - mw, my - mw * 0.75, hc[0] + mw, my + mw * 0.75], 0, 180, fill=col, width=max(2, lw // 2))
+    elif mood == "sad":
+        d.arc([hc[0] - mw, my - mw * 0.75, hc[0] + mw, my + mw * 0.75], 180, 360, fill=col, width=max(2, lw // 2))
+    else:
+        d.line([(hc[0] - mw * 0.7, my), (hc[0] + mw * 0.7, my)], fill=col, width=max(2, lw // 2))
+    sh = (neck[0], neck[1] + tor * 0.10)
+    for an in (ar, al):
+        d.line([sh, (sh[0] + math.sin(an) * arm, sh[1] + math.cos(an) * arm)], fill=col, width=lw, joint="curve")
+    for an in (lr, ll):
+        d.line([hip, (hip[0] + math.sin(an) * leg, int(fy + bounce))], fill=col, width=lw, joint="curve")
+
+
+PALETTES = [((16, 20, 40), (46, 60, 120), (255, 214, 102)), ((28, 18, 44), (92, 46, 120), (140, 240, 200)),
+            ((12, 34, 34), (22, 92, 96), (255, 168, 120)), ((36, 16, 24), (128, 46, 66), (255, 230, 150)),
+            ((14, 24, 36), (36, 84, 140), (255, 120, 160)), ((26, 26, 18), (96, 96, 44), (170, 230, 255))]
+
+
+def grad(size, c1, c2):
+    w, h = size
+    base = Image.new("RGB", (1, h))
+    px = base.load()
+    for y in range(h):
+        u = y / max(1, h - 1)
+        px[0, y] = tuple(int(c1[i] + (c2[i] - c1[i]) * u) for i in range(3))
+    return base.resize((w, h), Image.BILINEAR)
+
+
+class R:
+    def __init__(self):
+        self.sc = W / 720.0
+        self.lw = max(4, int(7 * self.sc))
+        self.fc = font(int(37 * self.sc))
+        self.fs = font(int(23 * self.sc))
+        self.fh = font(int(28 * self.sc))
+
+    def frame(self, idx, total, scene, t, dur, title):
+        s = self.sc
+        c1, c2, acc = PALETTES[idx % len(PALETTES)]
+        img = grad((W, H), c1, c2)
+        d = ImageDraw.Draw(img, "RGBA")
+        for k in range(3):
+            r = int((95 + k * 58) * s)
+            ox = int(W * (0.20 + 0.30 * k) + math.sin(t * 0.6 + k) * 22 * s)
+            oy = int(H * (0.20 + 0.08 * k) + math.cos(t * 0.5 + k) * 18 * s)
+            d.ellipse([ox - r, oy - r, ox + r, oy + r], outline=(*acc, 26), width=max(2, int(3 * s)))
+        fy = int(H * 0.705)
+        d.line([(0, fy), (W, fy)], fill=(*acc, 45), width=max(2, int(2 * s)))
+        fig = H * 0.36
+        cx = int(W * 0.5 + math.sin(t * 0.8) * 14 * s)
+        d.ellipse([cx - int(fig * 0.3), fy - int(9 * s), cx + int(fig * 0.3), fy + int(9 * s)], fill=(0, 0, 0, 70))
+        stickman(d, cx, fy, fig, scene["mood"], t, (255, 255, 255), self.lw)
+        prop = scene.get("prop") or detect_prop(scene["text"])
+        if prop in (None, "", "none"):
+            prop = "dots"
+        if prop != "none":
+            side = -1 if idx % 2 == 0 else 1
+            px = int(W * 0.5 + side * W * 0.30 + math.sin(t * 1.1) * 6 * s)
+            draw_prop(d, prop, px, int(fy - fig * 0.78), fig * 0.58, t, (255, 255, 255), acc, self.lw)
+        bw, bx, by = W - int(60 * s), int(30 * s), int(26 * s)
+        d.rounded_rectangle([bx, by, bx + bw, by + int(9 * s)], radius=int(5 * s), fill=(255, 255, 255, 50))
+        prog = (idx + t / max(dur, 0.01)) / max(total, 1)
+        d.rounded_rectangle([bx, by, bx + int(bw * min(1.0, prog)), by + int(9 * s)], radius=int(5 * s), fill=acc)
+        tw = measure(self.fh, str(title))
+        hh = self.fh.size + int(16 * s)
+        hx, hy = W // 2, int(50 * s)
+        d.rounded_rectangle([hx - tw / 2 - int(20 * s), hy, hx + tw / 2 + int(20 * s), hy + hh], radius=hh // 2,
+                            fill=(0, 0, 0, 110), outline=(*acc, 110), width=max(2, int(2 * s)))
+        dtext(d, (hx, hy + hh // 2), str(title), self.fh, (255, 255, 255, 245), "mm")
+        lines = wrap(scene["text"], self.fc, int(W - 120 * s), 3)
+        lh, pad = int(self.fc.size * 1.5), int(28 * s)
+        top = int(H * 0.735)
+        box = [int(38 * s), top, W - int(38 * s), top + lh * len(lines) + pad * 2]
+        d.rounded_rectangle(box, radius=int(28 * s), fill=(0, 0, 0, 140), outline=(*acc, 130), width=max(2, int(2 * s)))
+        cy = box[1] + pad
+        for ln in lines:
+            rich_line(d, W // 2, cy, ln, self.fc, (255, 255, 255), acc)
+            cy += lh
+        dtext(d, (W // 2, H - int(32 * s)), "ستيك مان" if LANG_AR else "STICK MAN", self.fs, (255, 255, 255, 130), "md")
+        return img
+
+
+# ───────────────────────── النص: AI ثم قوالب محلية ─────────────────────────
+SYS = """أنت كاتب ريلز لشخصية "ستيك مان". أعد JSON فقط:
+{"title":"عنوان قصير","caption":"وصف 1-2 جملة ينتهي بسؤال","hashtags":["#وسم"],
+ "scenes":[{"text":"جملة قصيرة أقل من 90 حرف","mood":"walk","prop":"clock"}]}
+4-6 مشاهد. mood من: walk, talk, think, sad, happy, run, jump, point.
+prop من: none, clock, coins, plant, mountain, book, shadow, steps, hourglass, fire, heart, wall, trophy, star, mirror.
+المشهد الأول خطاف، الأخير خلاصة. بلا إيموجي ولا مواضيع سياسية أو دينية حساسة."""
+
+TPL = [
+ {"title": "البداية الصعبة", "caption": "كلنا مرينا بهذي اللحظة. صح لو لا؟", "hashtags": ["#تحفيز", "#ستيك_مان", "#ريلز"],
+  "scenes": [{"text": "شنو الفرق بينك وبين اللي نجح؟", "mood": "think"}, {"text": "الفرق مو بالذكاء ولا بالحظ ولا بالفلوس.", "mood": "talk"},
+             {"text": "الفرق إنه هو بدأ وهو مو جاهز.", "mood": "point"}, {"text": "وإنت بعدك تنتظر اللحظة المثالية.", "mood": "sad"},
+             {"text": "ابدأ اليوم، وخلّي اللحظة المثالية تلحقك.", "mood": "run"}]},
+ {"title": "الصبر", "caption": "الصبر مو انتظار، الصبر شغل. توافق؟", "hashtags": ["#صبر", "#تحفيز", "#ريلز"],
+  "scenes": [{"text": "الناس تحسب الصبر يعني تنتظر.", "mood": "walk"}, {"text": "لكن الصبر الحقيقي يعني تشتغل وما تشوف نتيجة.", "mood": "talk"},
+             {"text": "تزرع كل يوم، وتسقي، وتسكت.", "mood": "think"}, {"text": "وبعد شهور يطلع الشي اللي الكل يستغرب منه.", "mood": "jump"},
+             {"text": "استمر. الجذور تنمو قبل ما تشوفها.", "mood": "happy"}]},
+ {"title": "الخوف", "caption": "شنو الشي اللي تخاف منه أكثر شي؟", "hashtags": ["#خوف", "#شجاعة", "#ريلز"],
+  "scenes": [{"text": "الخوف مو عدوّك، الخوف يخبرك إنه هذا الشي يهمك.", "mood": "think"}, {"text": "الشجاعة مو إنك ما تخاف.", "mood": "talk"},
+             {"text": "الشجاعة إنك تخاف وتقدّم خطوة وحدة.", "mood": "walk"}, {"text": "خطوة وحدة كل يوم تكفي.", "mood": "run"},
+             {"text": "وبعد سنة راح تشكر نفسك إنك ما رجعت.", "mood": "happy"}]},
+ {"title": "الوقت", "caption": "وين يصرف أغلب وقتك؟ بصراحة", "hashtags": ["#وقت", "#إنتاجية", "#ريلز"],
+  "scenes": [{"text": "كل الناس عندها نفس الأربع وعشرين ساعة.", "mood": "talk"}, {"text": "الغني والفقير، الناجح والفاشل، نفس العدد.", "mood": "think"},
+             {"text": "الفرق بس وين تحطها.", "mood": "point"}, {"text": "ساعة كل يوم تصير ثلاث مية وخمس وستين ساعة بالسنة.", "mood": "jump"},
+             {"text": "اختار شي واحد، وأعطه ساعة اليوم.", "mood": "walk"}]},
+ {"title": "المقارنة", "caption": "بطلت تقارن نفسك بغيرك؟ شلون؟", "hashtags": ["#مقارنة", "#سلام_داخلي", "#ريلز"],
+  "scenes": [{"text": "أكبر سرقة تسرقها من نفسك إنك تقارن نفسك بغيرك.", "mood": "sad"}, {"text": "تشوف نتيجتهم، ما تشوف سنين تعبهم.", "mood": "think"},
+             {"text": "ولا تشوف ليلهم الطويل.", "mood": "talk"}, {"text": "قارن نفسك بشخص واحد فقط: نفسك قبل سنة.", "mood": "point"},
+             {"text": "هذا هو المقياس الوحيد العادل.", "mood": "happy"}]},
+ {"title": "الفشل", "caption": "شنو أكثر فشل تعلمت منه؟", "hashtags": ["#فشل", "#تعلم", "#ريلز"],
+  "scenes": [{"text": "الفشل مو نهاية الطريق.", "mood": "talk"}, {"text": "الفشل درس، ودفعت ثمنه وقتك.", "mood": "think"},
+             {"text": "الغلط الوحيد إنك تكرر نفس الغلط.", "mood": "point"}, {"text": "قف، اكتب شنو صار، وغيّر شي واحد.", "mood": "walk"},
+             {"text": "هيك تتحول الخسارة إلى استثمار.", "mood": "jump"}]},
 ]
 
 
-def draw_ambient_particles(draw, global_frame, accent):
-    for idx, p in enumerate(PARTICLES):
-        px = int((p["x"] + math.sin(global_frame * 0.04 + p["phase"]) * 28) % 1080)
-        py = int((p["y"] - global_frame * p["speed_y"]) % 1920)
-        r = p["r"]
-        col = accent if idx % 3 == 0 else "#1E293B"
-        draw.ellipse([(px - r, py - r), (px + r, py + r)], fill=col)
-
-
-# 4. رسم المشهد التوضيحي المتحرك المعبر عن الجملة
-def draw_visual_prop(draw, visual_type, vx, vy, frame_num, accent_color):
-    scale = min(1.0, (frame_num + 1) / 8.0)
-    pulse = int(math.sin(frame_num * 0.25) * 8)
-
-    ring_r = int(175 * scale)
-    if ring_r > 10:
-        draw.ellipse(
-            [(vx - ring_r, vy - ring_r), (vx + ring_r, vy + ring_r)],
-            fill="#111A2E",
-            outline=accent_color,
-            width=4
-        )
-        inner_r = max(5, ring_r - 22 + pulse // 2)
-        draw.ellipse(
-            [(vx - inner_r, vy - inner_r), (vx + inner_r, vy + inner_r)],
-            outline="#1E293B",
-            width=2
-        )
-
-    if scale < 0.4:
-        return
-
-    v = (visual_type or "IDEA_BULB").upper()
-
-    if "BOOK" in v:
-        bob = int(math.sin(frame_num * 0.25) * 6)
-        by = vy + 15 + bob
-        left_page = [(vx - 95, by - 35), (vx - 4, by - 18), (vx - 4, by + 62), (vx - 95, by + 45)]
-        right_page = [(vx + 4, by - 18), (vx + 95, by - 35), (vx + 95, by + 45), (vx + 4, by + 62)]
-        draw.polygon(left_page, fill="#F8FAFC", outline="#38BDF8")
-        draw.polygon(right_page, fill="#E2E8F0", outline="#38BDF8")
-        draw.line([(vx, by - 18), (vx, by + 65)], fill="#0284C7", width=6)
-        for row in range(3):
-            ry = by - 5 + row * 16
-            draw.line([(vx - 76, ry - 4), (vx - 22, ry + 3)], fill="#94A3B8", width=4)
-            draw.line([(vx + 22, ry + 3), (vx + 76, ry - 4)], fill="#94A3B8", width=4)
-        for ang in [-50, -25, 0, 25, 50]:
-            rad = math.radians(ang - 90)
-            r1 = 35 + (frame_num % 6) * 2
-            r2 = 75 + (frame_num % 6) * 3
-            x1, y1 = vx + int(math.cos(rad) * r1), by - 25 + int(math.sin(rad) * r1)
-            x2, y2 = vx + int(math.cos(rad) * r2), by - 25 + int(math.sin(rad) * r2)
-            draw.line([(x1, y1), (x2, y2)], fill="#FACC15", width=5)
-
-    elif "HEART" in v:
-        beat = int(abs(math.sin(frame_num * 0.28)) * 8)
-        hy = vy - 5
-        draw.ellipse([(vx - 58 - beat, hy - 52 - beat), (vx + 4, hy + 10)], fill="#10B981")
-        draw.ellipse([(vx - 4, hy - 52 - beat), (vx + 58 + beat, hy + 10)], fill="#10B981")
-        tri = [(vx - 55 - beat, hy - 8), (vx + 55 + beat, hy - 8), (vx, hy + 68 + beat)]
-        draw.polygon(tri, fill="#10B981")
-        halo_r = 88 + beat
-        draw.ellipse([(vx - halo_r, hy - halo_r + 8), (vx + halo_r, hy + halo_r + 8)], outline="#6EE7B7", width=3)
-
-    elif "MONEY" in v:
-        bob = int(math.sin(frame_num * 0.28) * 6)
-        cx_c, cy_c = vx - 18, vy + 8 + bob
-        draw.ellipse([(cx_c - 64, cy_c - 64), (cx_c + 64, cy_c + 64)], fill="#F59E0B", outline="#FEF08A", width=6)
-        draw.ellipse([(cx_c - 46, cy_c - 46), (cx_c + 46, cy_c + 46)], outline="#FEF08A", width=3)
-        draw.line([(cx_c, cy_c - 30), (cx_c, cy_c + 30)], fill="#451A03", width=6)
-        draw.arc([(cx_c - 18, cy_c - 22), (cx_c + 18, cy_c + 2)], start=45, end=270, fill="#451A03", width=6)
-        draw.arc([(cx_c - 18, cy_c - 2), (cx_c + 18, cy_c + 22)], start=225, end=90, fill="#451A03", width=6)
-        ax, ay = vx + 58, vy - 35 - bob
-        draw.line([(vx + 22, vy + 35), (ax, ay)], fill="#10B981", width=11)
-        draw.polygon([(ax - 18, ay - 6), (ax + 12, ay - 16), (ax + 8, ay + 16)], fill="#10B981")
-
-    elif "COMPASS" in v:
-        draw.ellipse([(vx - 96, vy - 96), (vx + 96, vy + 96)], fill="#0F172A", outline="#00F0FF", width=8)
-        draw.ellipse([(vx - 76, vy - 76), (vx + 76, vy + 76)], outline="#1E293B", width=2)
-        ang = math.sin(frame_num * 0.16) * 0.55 - (math.pi / 4.0)
-        nx = int(math.cos(ang) * 66)
-        ny = int(math.sin(ang) * 66)
-        px = int(math.cos(ang + math.pi / 2.0) * 16)
-        py = int(math.sin(ang + math.pi / 2.0) * 16)
-        draw.polygon([(vx + nx, vy + ny), (vx + px, vy + py), (vx - px, vy - py)], fill="#EF4444")
-        draw.polygon([(vx - nx, vy - ny), (vx + px, vy + py), (vx - px, vy - py)], fill="#F8FAFC")
-        draw.ellipse([(vx - 10, vy - 10), (vx + 10, vy + 10)], fill="#FACC15")
-
-    elif "COMMENT" in v or "QUESTION" in v:
-        bob = int(math.sin(frame_num * 0.3) * 7)
-        bx, by = vx, vy - 10 + bob
-        draw.rounded_rectangle(
-            [(bx - 105, by - 65), (bx + 105, by + 55)],
-            radius=30,
-            fill="#1E1B4B",
-            outline="#A855F7",
-            width=6
-        )
-        tail = [(bx - 45, by + 52), (bx - 70, by + 88), (bx - 10, by + 52)]
-        draw.polygon(tail, fill="#1E1B4B", outline="#A855F7")
-        draw.line([(bx - 42, by + 52), (bx - 13, by + 52)], fill="#1E1B4B", width=8)
-
-        for d_idx in range(3):
-            dx = bx - 44 + d_idx * 44
-            dy = by - 5 + int(math.sin(frame_num * 0.45 - d_idx * 0.9) * 8)
-            dot_col = "#FACC15" if d_idx == (frame_num // 5) % 3 else "#E9D5FF"
-            draw.ellipse([(dx - 11, dy - 11), (dx + 11, dy + 11)], fill=dot_col)
-
-        qx, qy = bx + 85, by - 58
-        draw.ellipse([(qx - 26, qy - 26), (qx + 26, qy + 26)], fill="#FACC15", outline="#090D16", width=4)
-        draw.arc([(qx - 10, qy - 14), (qx + 10, qy + 4)], start=180, end=45, fill="#090D16", width=5)
-        draw.ellipse([(qx - 3, qy + 10), (qx + 3, qy + 16)], fill="#090D16")
-
-    elif "FOLLOW" in v:
-        card_w, card_h = 210, 110
-        bounce = int(math.sin(frame_num * 0.35) * 6)
-        cy_card = vy + bounce
-        draw.rounded_rectangle(
-            [(vx - card_w // 2, cy_card - card_h // 2), (vx + card_w // 2, cy_card + card_h // 2)],
-            radius=28,
-            fill="#0284C7",
-            outline="#F8FAFC",
-            width=5
-        )
-        px, py = vx + 45, cy_card
-        draw.ellipse([(px - 26, py - 26), (px + 26, py + 26)], fill="#F8FAFC")
-        draw.line([(px - 13, py), (px + 13, py)], fill="#0284C7", width=6)
-        draw.line([(px, py - 13), (px, py + 13)], fill="#0284C7", width=6)
-
-        bx, by = vx - 35, cy_card
-        swing = int(math.sin(frame_num * 0.5) * 5)
-        draw.chord([(bx - 22 + swing, by - 24), (bx + 22 + swing, by + 18)], start=180, end=360, fill="#FACC15")
-        draw.rectangle([(bx - 22 + swing, by - 4), (bx + 22 + swing, by + 12)], fill="#FACC15")
-        draw.rounded_rectangle([(bx - 28 + swing, by + 10), (bx + 28 + swing, by + 18)], radius=4, fill="#FACC15")
-        draw.ellipse([(bx - 7 - swing, by + 18), (bx + 7 - swing, by + 30)], fill="#FEF08A")
-
-        ripple_r = 25 + (frame_num * 5) % 55
-        if ripple_r < 75:
-            draw.ellipse(
-                [(px - ripple_r, py - ripple_r), (px + ripple_r, py + ripple_r)],
-                outline="#38BDF8",
-                width=3
-            )
-
-    elif "WIFI" in v:
-        base_y = vy + 65
-        draw.ellipse([(vx - 16, base_y - 16), (vx + 16, base_y + 16)], fill="#00F0FF")
-        active_wave = (frame_num // 4) % 4
-        for w_idx, r_arc in enumerate([55, 95, 135]):
-            col = "#00F0FF" if w_idx <= active_wave else "#1E293B"
-            draw.arc(
-                [(vx - r_arc, base_y - r_arc), (vx + r_arc, base_y + r_arc)],
-                start=225,
-                end=315,
-                fill=col,
-                width=12
-            )
-
-    elif "MAGNIFIER" in v:
-        ox = int(math.cos(frame_num * 0.2) * 18)
-        oy = int(math.sin(frame_num * 0.25) * 14)
-        gx, gy = vx - 15 + ox, vy - 15 + oy
-        draw.line([(gx + 45, gy + 45), (gx + 98, gy + 98)], fill="#94A3B8", width=18)
-        draw.ellipse([(gx - 68, gy - 68), (gx + 68, gy + 68)], fill="#0F172A", outline="#00F0FF", width=10)
-        draw.arc([(gx - 46, gy - 46), (gx + 46, gy + 46)], start=200, end=270, fill="#38BDF8", width=5)
-
-    elif "BATTERY" in v:
-        bw, bh = 110, 190
-        draw.rounded_rectangle([(vx - 30, vy - bh // 2 - 18), (vx + 30, vy - bh // 2)], radius=6, fill="#94A3B8")
-        draw.rounded_rectangle([(vx - bw // 2, vy - bh // 2), (vx + bw // 2, vy + bh // 2)], radius=18, outline="#F8FAFC", width=8)
-        level = 0.25 + 0.55 * (0.5 + 0.5 * math.cos(frame_num * 0.15))
-        fill_h = int((bh - 24) * level)
-        b_color = "#EF4444" if level < 0.45 else "#10B981"
-        draw.rounded_rectangle(
-            [(vx - bw // 2 + 12, vy + bh // 2 - 12 - fill_h), (vx + bw // 2 - 12, vy + bh // 2 - 12)],
-            radius=10,
-            fill=b_color
-        )
-        bolt = [(vx + 8, vy - 45), (vx - 22, vy + 5), (vx + 2, vy + 5), (vx - 12, vy + 50), (vx + 24, vy - 5), (vx - 2, vy - 5)]
-        draw.polygon(bolt, fill="#FACC15")
-
-    elif "PHONE" in v:
-        pw, ph = 115, 205
-        draw.rounded_rectangle([(vx - pw // 2, vy - ph // 2), (vx + pw // 2, vy + ph // 2)], radius=22, fill="#0F172A", outline="#F8FAFC", width=7)
-        draw.line([(vx - 22, vy - ph // 2 + 16), (vx + 22, vy - ph // 2 + 16)], fill="#64748B", width=5)
-        for idx, col in enumerate(["#00F0FF", "#F43F5E", "#10B981", "#F59E0B"]):
-            ox = -26 if idx % 2 == 0 else 26
-            oy = -32 if idx < 2 else 32
-            dy = int(math.sin(frame_num * 0.3 + idx) * 6)
-            draw.rounded_rectangle([(vx + ox - 18, vy + oy - 18 + dy), (vx + ox + 18, vy + oy + 18 + dy)], radius=8, fill=col)
-
-    elif "WARNING" in v:
-        s = 115 + pulse
-        tri = [(vx, vy - s), (vx - s, vy + int(s * 0.75)), (vx + s, vy + int(s * 0.75))]
-        draw.polygon(tri, fill="#450A0A", outline="#EF4444")
-        draw.line([tri[0], tri[1], tri[2], tri[0]], fill="#EF4444", width=10)
-        draw.line([(vx, vy - 40), (vx, vy + 22)], fill="#FACC15", width=14)
-        draw.ellipse([(vx - 8, vy + 38), (vx + 8, vy + 54)], fill="#FACC15")
-
-    elif "ROCKET" in v:
-        ry = vy + int(math.sin(frame_num * 0.4) * 12)
-        body = [(vx, ry - 105), (vx - 42, ry + 35), (vx + 42, ry + 35)]
-        draw.polygon(body, fill="#F8FAFC", outline="#00F0FF")
-        draw.polygon([(vx - 42, ry + 5), (vx - 72, ry + 55), (vx - 42, ry + 35)], fill="#F43F5E")
-        draw.polygon([(vx + 42, ry + 5), (vx + 72, ry + 55), (vx + 42, ry + 35)], fill="#F43F5E")
-        draw.ellipse([(vx - 18, ry - 45), (vx + 18, ry - 9)], fill="#0284C7", outline="#00F0FF", width=4)
-        flame_h = 45 + (frame_num % 4) * 12
-        draw.polygon([(vx - 22, ry + 38), (vx + 22, ry + 38), (vx, ry + 38 + flame_h)], fill="#F59E0B")
-
-    elif "SECURITY" in v:
-        shield = [
-            (vx, vy - 105), (vx + 85, vy - 70), (vx + 72, vy + 35),
-            (vx, vy + 105), (vx - 72, vy + 35), (vx - 85, vy - 70)
-        ]
-        draw.polygon(shield, fill="#064E3B", outline="#10B981")
-        draw.line(shield + [shield[0]], fill="#10B981", width=9)
-        draw.line([(vx - 32, vy + 2), (vx - 8, vy + 28), (vx + 38, vy - 25)], fill="#F8FAFC", width=12)
-
-    elif "CHART" in v:
-        bars = [55, 95, 145, 195]
-        for i, bh in enumerate(bars):
-            anim_h = int(bh * min(1.0, (frame_num + 4) / (10 + i * 3)))
-            bx = vx - 85 + i * 45
-            col = "#00F0FF" if i < 3 else "#10B981"
-            draw.rounded_rectangle([(bx, vy + 95 - anim_h), (bx + 32, vy + 95)], radius=6, fill=col)
-
-    elif "CLOCK" in v:
-        draw.ellipse([(vx - 105, vy - 105), (vx + 105, vy + 105)], fill="#0F172A", outline="#00F0FF", width=9)
-        angle = frame_num * 0.35
-        hx = vx + int(math.cos(angle) * 70)
-        hy = vy + int(math.sin(angle) * 70)
-        draw.line([(vx, vy), (vx, vy - 55)], fill="#F8FAFC", width=8)
-        draw.line([(vx, vy), (hx, hy)], fill="#F43F5E", width=6)
-        draw.ellipse([(vx - 8, vy - 8), (vx + 8, vy + 8)], fill="#00F0FF")
-
-    elif "GLOBE" in v:
-        draw.ellipse([(vx - 105, vy - 105), (vx + 105, vy + 105)], outline="#00F0FF", width=7)
-        rx = max(15, int(abs(math.cos(frame_num * 0.12)) * 95))
-        draw.ellipse([(vx - rx, vy - 105), (vx + rx, vy + 105)], outline="#38BDF8", width=4)
-        draw.line([(vx - 105, vy), (vx + 105, vy)], fill="#38BDF8", width=4)
-        draw.line([(vx - 90, vy - 48), (vx + 90, vy - 48)], fill="#38BDF8", width=3)
-        draw.line([(vx - 90, vy + 48), (vx + 90, vy + 48)], fill="#38BDF8", width=3)
-
-    elif "AI" in v or "BRAIN" in v:
-        nodes = [
-            (vx, vy - 80), (vx - 80, vy - 25), (vx + 80, vy - 25),
-            (vx - 55, vy + 65), (vx + 55, vy + 65), (vx, vy + 5)
-        ]
-        for i in range(len(nodes)):
-            for j in range(i + 1, len(nodes)):
-                draw.line([nodes[i], nodes[j]], fill="#0284C7", width=4)
-        for idx, (nx, ny) in enumerate(nodes):
-            nr = 14 + int(math.sin(frame_num * 0.3 + idx) * 4)
-            draw.ellipse([(nx - nr, ny - nr), (nx + nr, ny + nr)], fill="#00F0FF", outline="#F8FAFC", width=3)
-
-    else:
-        draw.ellipse([(vx - 65 - pulse // 2, vy - 85 - pulse // 2), (vx + 65 + pulse // 2, vy + 45 + pulse // 2)], fill="#FACC15", outline="#FEF08A", width=5)
-        draw.rounded_rectangle([(vx - 30, vy + 40), (vx + 30, vy + 80)], radius=8, fill="#94A3B8")
-        for ang in range(0, 360, 45):
-            rad = math.radians(ang + frame_num * 3)
-            x1, y1 = vx + int(math.cos(rad) * 80), vy - 20 + int(math.sin(rad) * 80)
-            x2, y2 = vx + int(math.cos(rad) * 105), vy - 20 + int(math.sin(rad) * 105)
-            draw.line([(x1, y1), (x2, y2)], fill="#FACC15", width=5)
-
-
-# 5. رسم الستيك مان المطوّر (نظارات تقنية ذكية + تفاصيل ياقة)
-def draw_upgraded_stickman(draw, cx, cy, pose, frame_num, mouth_open, accent, has_side_visual):
-    p = (pose or "POINTING").upper()
-    body_color = "#F8FAFC"
-    dark_detail = "#0F172A"
-    line_width = 18
-    r = line_width // 2
-
-    draw.line([(cx, cy), (cx, cy + 230)], fill=body_color, width=line_width)
-    draw.polygon([(cx - 24, cy + 16), (cx + 24, cy + 16), (cx, cy + 52)], fill=accent)
-    draw.line([(cx, cy + 230), (cx - 72, cy + 420)], fill=body_color, width=line_width)
-    draw.line([(cx, cy + 230), (cx + 72, cy + 420)], fill=body_color, width=line_width)
-    draw_joint(draw, (cx - 72, cy + 420), r, body_color)
-    draw_joint(draw, (cx + 72, cy + 420), r, body_color)
-
-    draw.ellipse([(cx - 94, cy - 188), (cx + 94, cy)], fill="#131C31", outline=body_color, width=14)
-
-    draw.arc([(cx - 107, cy - 203), (cx + 107, cy - 82)], start=180, end=360, fill=accent, width=12)
-    draw.rounded_rectangle([(cx - 120, cy - 134), (cx - 90, cy - 62)], radius=12, fill=accent, outline=dark_detail, width=4)
-    draw.rounded_rectangle([(cx + 90, cy - 134), (cx + 120, cy - 62)], radius=12, fill=accent, outline=dark_detail, width=4)
-
-    eye_shift = 12 if has_side_visual else 0
-    gx = cx + eye_shift
-    gy = cy - 110
-    draw.rounded_rectangle([(gx - 62, gy - 20), (gx - 8, gy + 16)], radius=10, fill="#090D16", outline=accent, width=5)
-    draw.rounded_rectangle([(gx + 8, gy - 20), (gx + 62, gy + 16)], radius=10, fill="#090D16", outline=accent, width=5)
-    draw.line([(gx - 8, gy - 4), (gx + 8, gy - 4)], fill=accent, width=6)
-    draw.ellipse([(gx - 42, gy - 8), (gx - 26, gy + 8)], fill="#FFFFFF")
-    draw.ellipse([(gx + 26, gy - 8), (gx + 42, gy + 8)], fill="#FFFFFF")
-    draw.line([(gx - 50, gy - 12), (gx - 38, gy + 6)], fill=accent, width=3)
-    draw.line([(gx + 20, gy - 12), (gx + 32, gy + 6)], fill=accent, width=3)
-
-    mx = gx
-    my = cy - 58
-    if mouth_open > 0.25:
-        mh = int(8 + mouth_open * 22)
-        mw = int(20 + mouth_open * 10)
-        draw.ellipse([(mx - mw, my - mh // 2), (mx + mw, my + mh // 2)], fill="#090D16", outline=body_color, width=5)
-    else:
-        draw.arc([(mx - 28, my - 15), (mx + 28, my + 15)], start=10, end=170, fill=body_color, width=7)
-
-    if p == "WELCOME":
-        draw.line([(cx, cy + 45), (cx - 95, cy + 165)], fill=body_color, width=line_width)
-        draw_joint(draw, (cx - 95, cy + 165), r, body_color)
-        wave = int(math.sin(frame_num * 0.4) * 28)
-        draw.line([(cx, cy + 45), (cx + 95, cy - 15), (cx + 135 + wave, cy - 95)], fill=body_color, width=line_width)
-        draw_joint(draw, (cx + 95, cy - 15), r, body_color)
-        draw_joint(draw, (cx + 135 + wave, cy - 95), r + 3, accent)
-
-    elif p == "FOLLOW":
-        wave_l = int(math.sin(frame_num * 0.4) * 22)
-        draw.line([(cx, cy + 45), (cx - 85, cy - 15), (cx - 120 - wave_l, cy - 90)], fill=body_color, width=line_width)
-        draw_joint(draw, (cx - 120 - wave_l, cy - 90), r + 3, "#FACC15")
-
-        point_y = 685 + int(math.sin(frame_num * 0.35) * 12)
-        draw.line([(cx, cy + 45), (cx + 110, cy + 15), (cx + 225, point_y)], fill=body_color, width=line_width)
-        draw_joint(draw, (cx + 225, point_y), r + 4, accent)
-
-    elif p == "WARNING":
-        shake = int(math.sin(frame_num * 0.6) * 10)
-        draw.line([(cx, cy + 45), (cx - 75, cy - 10), (cx - 65, cy - 85 + shake)], fill=body_color, width=line_width)
-        draw.line([(cx, cy + 45), (cx + 95, cy - 15), (cx + 165, cy - 65 - shake)], fill=body_color, width=line_width)
-        draw_joint(draw, (cx - 65, cy - 85 + shake), r + 2, accent)
-        draw_joint(draw, (cx + 165, cy - 65 - shake), r + 2, accent)
-
-    elif p == "SUCCESS":
-        pump = int(abs(math.sin(frame_num * 0.35)) * 22)
-        draw.line([(cx, cy + 45), (cx - 85, cy - 25), (cx - 110, cy - 105 - pump)], fill=body_color, width=line_width)
-        draw.line([(cx, cy + 45), (cx + 95, cy - 20), (cx + 145, cy - 95 - pump)], fill=body_color, width=line_width)
-        draw_joint(draw, (cx - 110, cy - 105 - pump), r + 3, accent)
-        draw_joint(draw, (cx + 145, cy - 95 - pump), r + 3, accent)
-
-    else:
-        draw.line([(cx, cy + 45), (cx - 75, cy + 120), (cx - 45, cy + 185)], fill=body_color, width=line_width)
-        draw_joint(draw, (cx - 45, cy + 185), r, body_color)
-
-        point_y = 695 + int(math.sin(frame_num * 0.35) * 14)
-        elbow_x = cx + 110
-        elbow_y = cy + 20
-        hand_x = cx + 225
-        draw.line([(cx, cy + 45), (elbow_x, elbow_y), (hand_x, point_y)], fill=body_color, width=line_width)
-        draw_joint(draw, (elbow_x, elbow_y), r, body_color)
-        draw_joint(draw, (hand_x, point_y), r + 4, accent)
-
-        for step in range(3):
-            lx = hand_x + 25 + step * 35 + ((frame_num * 4) % 25)
-            if lx < 555:
-                draw.line([(lx, point_y), (lx + 16, point_y)], fill=accent, width=5)
-
-
-def apply_camera_zoom(img, zoom):
-    """تقريب كاميرا ناعم مع الحفاظ على أبعاد الفيديو بدقة"""
-    if zoom <= 1.001:
-        return img
-    w, h = img.size
-    zw = int(w * zoom)
-    zh = int(h * zoom)
-    resized = img.resize((zw, zh), Image.Resampling.BILINEAR)
-    left = (zw - w) // 2
-    top = (zh - h) // 2
-    return resized.crop((left, top, left + w, top + h))
-
-
-# 6. رسم إطار الغلاف الاحترافي مع ضبط حجم الخط تلقائياً ليتناسب مع أي خط عربي
-def draw_cover_frame(title, page_name, frame_num, font_path, font_badge, size=(1080, 1920)):
-    accent = "#00F0FF"
-    img = Image.new("RGB", size, "#090D16")
-    draw = ImageDraw.Draw(img)
-
-    for i in range(0, size[0], 120):
-        draw.line([(i, 0), (i, size[1])], fill="#121A2B", width=1)
-    for j in range(0, size[1], 120):
-        draw.line([(0, j), (size[0], j)], fill="#121A2B", width=1)
-
-    draw_ambient_particles(draw, frame_num, accent)
-
-    if page_name:
-        shaped_name = shape_multiline(page_name, max_chars=30)
-        b_kwargs = {"font": font_badge}
-        if HAS_RAQM:
-            b_kwargs["direction"] = "rtl"
-        bb = draw.textbbox((0, 0), shaped_name, **b_kwargs)
-        bw = (bb[2] - bb[0]) + 56
-        bh = (bb[3] - bb[1]) + 26
-        bx1 = (size[0] - bw) // 2
-        by1 = 150
-        draw.rounded_rectangle([(bx1, by1), (bx1 + bw, by1 + bh)], radius=bh // 2, fill="#111A2E", outline=accent, width=3)
-        draw.text((bx1 + 28, by1 + (bh - (bb[3] - bb[1])) // 2 - 2), shaped_name, fill="#FFFFFF", **b_kwargs)
-
-    card_left, card_top, card_right, card_bottom = 90, 320, 990, 680
-    draw.rounded_rectangle(
-        [(card_left, card_top), (card_right, card_bottom)],
-        radius=38,
-        fill="#0F172A",
-        outline=accent,
-        width=6
-    )
-
-    shaped_title = shape_multiline(title, max_chars=20)
-    chosen_font_cover = ImageFont.load_default()
-    if font_path and os.path.exists(font_path):
-        for test_size in range(68, 42, -4):
-            candidate_font = ImageFont.truetype(font_path, test_size)
-            test_kwargs = {"font": candidate_font, "align": "center", "spacing": 16}
-            if HAS_RAQM:
-                test_kwargs["direction"] = "rtl"
-            tb = draw.multiline_textbbox((0, 0), shaped_title, **test_kwargs)
-            if (tb[2] - tb[0]) <= (card_right - card_left - 60) and (tb[3] - tb[1]) <= (card_bottom - card_top - 40):
-                chosen_font_cover = candidate_font
-                break
-        else:
-            chosen_font_cover = ImageFont.truetype(font_path, 44)
-
-    t_kwargs = {"font": chosen_font_cover, "align": "center", "spacing": 16}
-    if HAS_RAQM:
-        t_kwargs["direction"] = "rtl"
-    tb = draw.multiline_textbbox((0, 0), shaped_title, **t_kwargs)
-    tw = tb[2] - tb[0]
-    th = tb[3] - tb[1]
-    tx = (card_left + card_right - tw) // 2
-    ty = (card_top + card_bottom - th) // 2
-
-    draw.multiline_text((tx + 4, ty + 5), shaped_title, fill="#020617", **t_kwargs)
-    draw.multiline_text((tx, ty), shaped_title, fill="#FFFFFF", stroke_width=1, stroke_fill="#FFFFFF", **t_kwargs)
-
-    draw_upgraded_stickman(draw, 540, 1020, "WELCOME", frame_num, 0.4, accent, has_side_visual=False)
-    return img
-
-
-# 7. رسم المشهد الكامل مع الهوية والجزيئات وحركة الكاميرا
-def draw_scene_frame(pose, visual_type, frame_num, total_frames, global_frame, mouth_open, global_progress, page_name, font_badge, size=(1080, 1920)):
-    p = (pose or "POINTING").upper()
-
-    if p == "WARNING":
-        accent = "#EF4444"
-        bg_grid = "#241219"
-    elif p == "SUCCESS":
-        accent = "#10B981"
-        bg_grid = "#0F241E"
-    elif p == "FOLLOW":
-        accent = "#38BDF8"
-        bg_grid = "#0F2136"
-    elif p == "QUESTION":
-        accent = "#A855F7"
-        bg_grid = "#1E1433"
-    else:
-        accent = "#00F0FF"
-        bg_grid = "#121A2B"
-
-    img = Image.new("RGB", size, "#090D16")
-    draw = ImageDraw.Draw(img)
-
-    offset_grid = (global_frame * 2) % 120
-    for i in range(-120, size[0] + 120, 120):
-        draw.line([(i + offset_grid, 0), (i + offset_grid, size[1])], fill=bg_grid, width=1)
-    for j in range(0, size[1], 120):
-        draw.line([(0, j), (size[0], j)], fill=bg_grid, width=1)
-
-    draw_ambient_particles(draw, global_frame, accent)
-
-    has_side_visual = p != "WELCOME"
-    slide_t = min(1.0, (frame_num + 1) / 7.0)
-    target_cx = 310 if has_side_visual else 540
-    cx = int(540 + (target_cx - 540) * slide_t)
-    cy = 700 + int(math.sin(frame_num * 0.25) * 8)
-
-    if has_side_visual:
-        draw_visual_prop(draw, visual_type, 740, 680, frame_num, accent)
-    else:
-        draw_visual_prop(draw, visual_type, 540, 340, frame_num, accent)
-
-    draw_upgraded_stickman(draw, cx, cy, p, frame_num, mouth_open, accent, has_side_visual)
-
-    zoom = 1.0 + 0.035 * (frame_num / float(max(1, total_frames)))
-    img = apply_camera_zoom(img, zoom)
-    draw = ImageDraw.Draw(img)
-
-    draw.rectangle([(0, 0), (size[0], 12)], fill="#1E293B")
-    prog_w = int(size[0] * max(0.0, min(1.0, global_progress)))
-    if prog_w > 0:
-        draw.rectangle([(0, 0), (prog_w, 12)], fill=accent)
-
-    if page_name:
-        shaped_name = shape_multiline(page_name, max_chars=30)
-        badge_kwargs = {"font": font_badge}
-        if HAS_RAQM:
-            badge_kwargs["direction"] = "rtl"
-        bb = draw.textbbox((0, 0), shaped_name, **badge_kwargs)
-        bw = (bb[2] - bb[0]) + 56
-        bh = (bb[3] - bb[1]) + 26
-        bx1 = (size[0] - bw) // 2
-        by1 = 135
-        draw.rounded_rectangle(
-            [(bx1, by1), (bx1 + bw, by1 + bh)],
-            radius=bh // 2,
-            fill="#111A2E",
-            outline="#1E293B",
-            width=3
-        )
-        draw.ellipse([(bx1 + 18, by1 + bh // 2 - 6), (bx1 + 30, by1 + bh // 2 + 6)], fill=accent)
-        draw.text(
-            (bx1 + 42, by1 + (bh - (bb[3] - bb[1])) // 2 - 2),
-            shaped_name,
-            fill="#E2E8F0",
-            **badge_kwargs
-        )
-
-    return img, accent
-
-
-# 8. نظام النصوص المتحركة (Kinetic Motion Typography)
-def build_word_layout(draw, words, font, max_line_width=820, center_x=500, start_y=1190, line_height=86):
-    text_kwargs = {"font": font}
-    if HAS_RAQM:
-        text_kwargs["direction"] = "rtl"
-
-    space_bbox = draw.textbbox((0, 0), " ", **text_kwargs)
-    space_w = max(14, space_bbox[2] - space_bbox[0])
-
-    word_items = []
-    for idx, w in enumerate(words):
-        shaped = shape_word(w)
-        bbox = draw.textbbox((0, 0), shaped, **text_kwargs)
-        ww = bbox[2] - bbox[0]
-        wh = bbox[3] - bbox[1]
-        word_items.append({"idx": idx, "shaped": shaped, "w": ww, "h": wh})
-
-    lines = []
-    current_line = []
-    current_w = 0
-    for item in word_items:
-        added_w = item["w"] + (space_w if current_line else 0)
-        if current_line and (current_w + added_w > max_line_width):
-            lines.append((current_line, current_w))
-            current_line = [item]
-            current_w = item["w"]
-        else:
-            current_line.append(item)
-            current_w += added_w
-    if current_line:
-        lines.append((current_line, current_w))
-
-    positioned = []
-    for line_idx, (line_items, total_w) in enumerate(lines):
-        cursor_x = center_x + (total_w // 2)
-        y = start_y + line_idx * line_height
-        for item in line_items:
-            cursor_x -= item["w"]
-            positioned.append({
-                "idx": item["idx"],
-                "shaped": item["shaped"],
-                "x": cursor_x,
-                "y": y,
-                "w": item["w"],
-                "h": item["h"]
-            })
-            cursor_x -= space_w
-
-    return positioned
-
-
-def draw_kinetic_captions(draw, positioned_words, word_timings, current_time, total_duration, pose, accent, font):
-    p = (pose or "POINTING").upper()
-    text_kwargs = {"font": font}
-    if HAS_RAQM:
-        text_kwargs["direction"] = "rtl"
-
-    exit_progress = 0.0
-    if p != "FOLLOW" and (total_duration - current_time < 0.16):
-        exit_progress = max(0.0, min(1.0, (0.16 - (total_duration - current_time)) / 0.16))
-
-    for item in positioned_words:
-        idx = item["idx"]
-        w_start, w_end = word_timings[idx]
-
-        if current_time < w_start - 0.03:
+def js(text):
+    text = re.sub(r"^```(?:json)?|```$", "", text.strip(), flags=re.M).strip()
+    return json.loads(text[text.find("{"):text.rfind("}") + 1])
+
+
+def validate(sc):
+    out = []
+    for s in sc.get("scenes") or []:
+        t = re.sub(r"\s+", " ", str(s.get("text", "")).strip())[:130]
+        if not t:
             continue
-
-        enter_t = min(1.0, max(0.0, (current_time - (w_start - 0.03)) / 0.18))
-        dx, dy = 0, 0
-
-        if p in ("WELCOME", "SUCCESS", "FOLLOW", "QUESTION"):
-            dy = int((1.0 - ease_out_back(enter_t)) * 48)
-        elif p == "WARNING":
-            dy = int((1.0 - ease_out_cubic(enter_t)) * 30)
-            if enter_t < 1.0:
-                dx = int(math.sin(enter_t * 28.0) * (1.0 - enter_t) * 16)
-        elif p == "THINKING":
-            dy = int((1.0 - ease_out_cubic(enter_t)) * 32)
-        else:
-            dx = int((1.0 - ease_out_back(enter_t)) * 55)
-            dy = int((1.0 - ease_out_cubic(enter_t)) * 18)
-
-        dy -= int(exit_progress * 28)
-
-        is_speaking = (w_start <= current_time <= w_end + 0.06) and exit_progress == 0.0
-        if is_speaking:
-            dy -= 8
-
-        x = item["x"] + dx
-        y = item["y"] + dy
-        shaped = item["shaped"]
-
-        draw.text(
-            (x + 4, y + 5),
-            shaped,
-            fill="#030712",
-            stroke_width=3,
-            stroke_fill="#030712",
-            **text_kwargs
-        )
-
-        if is_speaking:
-            active_color = "#FACC15" if p in ("WARNING", "FOLLOW", "QUESTION") else accent
-            draw.text(
-                (x, y),
-                shaped,
-                fill=active_color,
-                stroke_width=2,
-                stroke_fill=active_color,
-                **text_kwargs
-            )
-            bar_y = y + item["h"] + 14
-            bar_prog = min(1.0, max(0.2, (current_time - w_start) / max(0.08, (w_end - w_start))))
-            bar_w = int(item["w"] * bar_prog)
-            bar_x2 = x + item["w"]
-            bar_x1 = bar_x2 - bar_w
-            draw.rounded_rectangle([(bar_x1, bar_y), (bar_x2, bar_y + 6)], radius=3, fill=active_color)
-        else:
-            draw.text(
-                (x, y),
-                shaped,
-                fill="#FFFFFF",
-                stroke_width=1,
-                stroke_fill="#FFFFFF",
-                **text_kwargs
-            )
+        mood = str(s.get("mood", "talk")).lower()
+        mood = mood if mood in ("walk", "talk", "think", "sad", "happy", "run", "jump", "point") else "talk"
+        prop = str(s.get("prop", "")).lower()
+        out.append({"text": t, "mood": mood, "prop": prop if prop in PROPS else detect_prop(t)})
+    if len(out) < 3:
+        raise ValueError("مشاهد قليلة")
+    tags = sc.get("hashtags") or []
+    if isinstance(tags, str):
+        tags = tags.split()
+    return {"title": str(sc.get("title", "")).strip()[:60] or "ريل", "caption": str(sc.get("caption", "")).strip()[:400],
+            "hashtags": [t if str(t).startswith("#") else f"#{t}" for t in tags][:8], "scenes": out[:6]}
 
 
-# 9. توليد الصوت مع التقاط توقيت الكلمات
-async def generate_scene_audio(text, voice, audio_fn):
-    communicate = edge_tts.Communicate(text, voice)
-    boundaries = []
-    with open(audio_fn, "wb") as f:
-        async for chunk in communicate.stream():
-            if chunk["type"] == "audio":
-                f.write(chunk["data"])
-            elif chunk["type"] == "WordBoundary":
-                start_sec = chunk["offset"] / 10_000_000.0
-                dur_sec = chunk.get("duration", 0) / 10_000_000.0
-                boundaries.append({
-                    "start": start_sec,
-                    "end": start_sec + dur_sec,
-                    "text": chunk.get("text", "")
-                })
-    return boundaries
+def gen_script():
+    import random
+    topic = TOPIC.strip()
+    prompt = f"اكتب سكربت ريل باللغة {'العربية' if LANG_AR else 'English'}." + (f" الموضوع: {topic}." if topic else " اختر موضوعاً تحفيزياً جديداً.")
+    srcs = []
+    if GK:
+        srcs.append(("gemini", lambda: js("".join(p.get("text", "") for p in __import__("requests").post(
+            f"https://generativelanguage.googleapis.com/v1beta/models/{GMODEL}:generateContent?key={GK}",
+            json={"system_instruction": {"parts": [{"text": SYS}]}, "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+                  "generationConfig": {"temperature": 0.9, "responseMimeType": "application/json"}}, timeout=60).json()
+            ["candidates"][0]["content"]["parts"]))))
+    for name, url, key, mdl in (("groq", "https://api.groq.com/openai/v1/chat/completions", GRK, E("GROQ_MODEL") or "llama-3.3-70b-versatile"),
+                                ("openrouter", "https://openrouter.ai/api/v1/chat/completions", ORK, E("OPENROUTER_MODEL") or "meta-llama/llama-3.3-70b-instruct:free")):
+        if key:
+            srcs.append((name, (lambda u, k, m: lambda: js(__import__("requests").post(
+                u, headers={"Authorization": f"Bearer {k}"}, timeout=60,
+                json={"model": m, "temperature": 0.9, "response_format": {"type": "json_object"},
+                      "messages": [{"role": "system", "content": SYS}, {"role": "user", "content": prompt}]})
+                .json()["choices"][0]["message"]["content"]))(url, key, mdl)))
+    for name, fn in srcs:
+        for at in (1, 2):
+            try:
+                log(f"توليد النص عبر {name}…")
+                s = validate(fn())
+                log(f"✅ النص من {name}: «{s['title']}»")
+                return s, name
+            except Exception as e:
+                log(f"⚠️ {name}: {type(e).__name__}: {str(e)[:120]}")
+    log("↩️ المولّد المحلي (بلا API)")
+    bank = TPL
+    hit = [x for x in bank if topic and topic in json.dumps(x, ensure_ascii=False)] if topic else []
+    sc = json.loads(json.dumps(random.choice(hit or bank)))
+    if topic and not hit and LANG_AR:
+        sc["scenes"][0]["text"], sc["title"] = f"موضوع اليوم: {topic}.", topic
+    for x in sc["scenes"]:
+        x.setdefault("prop", detect_prop(x["text"]))
+    return validate(sc), "local"
 
 
-# 10. تجميع الفيديو النهائي
-async def make_video(script_data, page_name):
-    print("بدء صناعة ريلز الستيك مان الاحترافي...")
-    scenes = script_data["scenes"]
-    cover_title = script_data.get("title", "إضاءات ومعلومات مفيدة!")
-    audio_paths = []
-    scene_boundaries = []
-    scene_durations = []
-    voice = "ar-SA-HamedNeural"
+# ───────────────────────── صوت ─────────────────────────
+async def _tts(text, out):
+    import edge_tts
+    await edge_tts.Communicate(text, VOICE, rate=RATE).save(str(out))
 
-    for idx, sc in enumerate(scenes):
-        audio_fn = f"scene_{idx}.mp3"
-        clean_text = re.sub(r"\[.*?\]", "", sc["text"]).strip()
-        boundaries = await generate_scene_audio(clean_text, voice, audio_fn)
-        audio_paths.append(audio_fn)
-        scene_boundaries.append(boundaries)
-        scene_durations.append(get_audio_duration(audio_fn))
 
-    total_video_duration = max(1.0, sum(scene_durations))
-    print(f"المدة الكلية للريلز: {total_video_duration:.1f} ثانية")
+def voice(text, out, i):
+    try:
+        asyncio.run(_tts(text, out))
+        d = duration(out)
+        if d > 0.2:
+            return d
+        raise RuntimeError("ملف فارغ")
+    except Exception as e:
+        log(f"⚠️ TTS مشهد {i + 1}: {type(e).__name__} — صوت صامت")
+        d = max(2.5, min(6.0, len(text) / 14 + 1.2))
+        subprocess.run([ffmpeg(), "-y", "-hide_banner", "-loglevel", "error", "-f", "lavfi",
+                        "-i", "anullsrc=r=44100:cl=stereo", "-t", f"{d:.2f}", "-c:a", "aac", str(out)], check=True)
+        return d
 
-    font_path = select_random_font()
-    if font_path and os.path.exists(font_path):
-        font_title = ImageFont.truetype(font_path, 56)
-        font_badge = ImageFont.truetype(font_path, 34)
-    else:
-        font_title = ImageFont.load_default()
-        font_badge = ImageFont.load_default()
 
-    video_clips = []
-    fps = 24
+# ───────────────────────── إنتاج ─────────────────────────
+def produce(script):
+    OUT.mkdir(parents=True, exist_ok=True)
+    (OUT / "audio").mkdir(exist_ok=True)
+    r, seeds, total = R(), [], len(script["scenes"])
+    log(f"🎬 {total} مشاهد {W}x{H}@{FPS}fps")
+    for i, sc in enumerate(script["scenes"]):
+        a = OUT / "audio" / f"s{i:02d}.m4a"
+        d = voice(sc["text"], a, i)
+        extra = f" · عنصر: {sc['prop']}" if sc.get("prop") not in (None, "", "none") else ""
+        log(f"   مشهد {i + 1}/{total} · {d:.1f}s · {sc['mood']}{extra} · «{sc['text'][:40]}…»")
+        dur = max(2.0, min(d + 0.45, 10.0))
+        seg = OUT / f"seg{i:02d}.mp4"
+        p = subprocess.Popen([ffmpeg(), "-y", "-hide_banner", "-loglevel", "error", "-f", "rawvideo", "-pix_fmt", "rgb24",
+                              "-s", f"{W}x{H}", "-r", str(FPS), "-i", "-", "-i", str(a), "-filter:a", "apad",
+                              "-c:v", "libx264", "-preset", "veryfast", "-crf", "24", "-pix_fmt", "yuv420p",
+                              "-c:a", "aac", "-b:a", "128k", "-ar", "44100", "-ac", "2", "-t", f"{dur:.3f}",
+                              "-movflags", "+faststart", str(seg)], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        for f in range(max(int(dur * FPS), 2)):
+            try:
+                p.stdin.write(r.frame(i, total, sc, f / FPS, dur, script["title"]).tobytes())
+            except BrokenPipeError:
+                break
+        p.stdin.close()
+        err = p.stderr.read().decode("utf-8", "ignore")
+        if p.wait() != 0:
+            raise RuntimeError(f"ffmpeg مشهد {i + 1}: {err[-300:]}")
+        seeds.append(seg)
+    lst = OUT / "list.txt"
+    lst.write_text("".join(f"file '{p.as_posix()}'\n" for p in seeds), encoding="utf-8")
+    final = OUT / "reel.mp4"
+    subprocess.run([ffmpeg(), "-y", "-hide_banner", "-loglevel", "error", "-f", "concat", "-safe", "0",
+                    "-i", str(lst), "-c", "copy", "-movflags", "+faststart", str(final)], check=True)
+    for p in seeds:
+        p.unlink(missing_ok=True)
+    shutil.rmtree(OUT / "audio", ignore_errors=True)
+    log(f"✅ {final} · {duration(final):.1f}s · {final.stat().st_size / 1e6:.1f}MB")
+    return final
 
-    dummy_img = Image.new("RGB", (1080, 1920))
-    dummy_draw = ImageDraw.Draw(dummy_img)
 
-    elapsed_offset = 0.0
-    global_frame_counter = 0
+# ───────────────────────── فيسبوك ─────────────────────────
+def publish(video, caption):
+    import requests
+    size = video.stat().st_size
+    log("📤 نشر على فيسبوك…")
 
-    for idx, sc in enumerate(scenes):
-        raw_text = re.sub(r"\[.*?\]", "", sc["text"]).strip()
-        words = [w for w in raw_text.split() if w.strip()]
-        pose = sc.get("pose", "POINTING")
-        visual = sc.get("visual", "IDEA_BULB")
-        audio_file = f"scene_{idx}.mp3"
+    def post(path, data):
+        r = requests.post(f"https://graph.facebook.com/{GRAPH}/{path}", data=data, timeout=120)
+        j = r.json()
+        if r.status_code >= 400 or "error" in j:
+            raise RuntimeError(json.dumps(j, ensure_ascii=False)[:400])
+        return j
 
-        duration = scene_durations[idx]
-        total_frames = max(int(duration * fps), 24)
-        envelope, word_timings = analyze_audio_and_timings(
-            audio_file, words, total_frames, duration, scene_boundaries[idx]
-        )
-        positioned_words = build_word_layout(
-            dummy_draw, words, font_title, max_line_width=820, center_x=500, start_y=1190, line_height=86
-        )
+    st = post(f"{FBP}/video_reels", {"upload_phase": "start", "access_token": FBT})
+    vid, url = st["video_id"], st.get("upload_url") or f"https://rupload.facebook.com/video-upload/{GRAPH}/{st['video_id']}"
+    with video.open("rb") as fh:
+        up = requests.post(url, headers={"Authorization": f"OAuth {FBT}", "offset": "0", "file_size": str(size)}, data=fh, timeout=600)
+    if up.status_code >= 400:
+        raise RuntimeError(f"upload {up.status_code}: {up.text[:300]}")
+    post(f"{FBP}/video_reels", {"upload_phase": "finish", "video_id": vid, "video_state": "PUBLISHED",
+                                "description": caption, "access_token": FBT})
+    for _ in range(20):
+        __import__("time").sleep(15)
+        r = requests.get(f"https://graph.facebook.com/{GRAPH}/{vid}",
+                         params={"fields": "status,permalink_url", "access_token": FBT}, timeout=60).json()
+        log(f"   الحالة: {(r.get('status') or {}).get('video_status')}")
+        if r.get("permalink_url"):
+            return r["permalink_url"]
+    return f"https://www.facebook.com/reel/{vid}"
 
-        print(f"ريندر المشهد {idx+1}/{len(scenes)} [{pose} + {visual}]: {raw_text}")
-        output_scene = f"scene_{idx}.mp4"
 
-        ffmpeg_cmd = [
-            FFMPEG_BIN, "-y",
-            "-f", "rawvideo",
-            "-vcodec", "rawvideo",
-            "-pix_fmt", "rgb24",
-            "-s", "1080x1920",
-            "-r", str(fps),
-            "-i", "-",
-            "-i", audio_file,
-            "-c:v", "libx264",
-            "-preset", "ultrafast",
-            "-crf", "20",
-            "-pix_fmt", "yuv420p",
-            "-c:a", "aac",
-            "-ac", "1",
-            "-ar", "44100",
-            "-shortest",
-            output_scene
-        ]
-
-        proc = subprocess.Popen(ffmpeg_cmd, stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
-
-        for f in range(total_frames):
-            current_time = f / float(fps)
-            global_progress = (elapsed_offset + current_time) / total_video_duration
-
-            if idx == 0 and f < 6:
-                frame_img = draw_cover_frame(cover_title, page_name, f, font_path, font_badge)
+# ───────────────────────── فحص ─────────────────────────
+def check():
+    ok = True
+    print("\n=== فحص الإعدادات ===\n")
+    try:
+        print(f"✅ ffmpeg: {subprocess.run([ffmpeg(), '-version'], capture_output=True, text=True).stdout.splitlines()[0][:50]}")
+    except SystemExit as e:
+        ok = False
+        print(f"❌ {e}")
+    fs = fonts()
+    print(("✅ الخطوط: " + ", ".join(fs)) if fs else "⚠️ لا خطوط — سيُستخدم خط النظام")
+    print(f"✅ Pillow {Image.__version__} · العربية: {'libraqm' if RAQM else 'reshaper'}")
+    try:
+        p = OUT / "_p.m4a"
+        OUT.mkdir(parents=True, exist_ok=True)
+        asyncio.run(_tts("مرحبا", p))
+        print(f"✅ الصوت {VOICE} ({duration(p):.1f}s)")
+        p.unlink(missing_ok=True)
+    except Exception as e:
+        ok = False
+        print(f"❌ الصوت: {type(e).__name__}: {str(e)[:100]}")
+    for n, k in (("Gemini", GK), ("Groq", GRK), ("OpenRouter", ORK)):
+        print(f"{'✅' if k else '⚪️'} {n}: {'مضبوط' if k else 'غير مضبوط (يوجد مولّد محلي)'}")
+    if FBT and FBP:
+        try:
+            r = __import__("requests").get(f"https://graph.facebook.com/{GRAPH}/{FBP}",
+                                           params={"fields": "id,name", "access_token": FBT}, timeout=45).json()
+            if "error" in r:
+                ok = False
+                print(f"❌ فيسبوك: {r['error'].get('message')}")
             else:
-                frame_img, accent = draw_scene_frame(
-                    pose, visual, f, total_frames, global_frame_counter,
-                    envelope[f], global_progress, page_name, font_badge
-                )
-                draw = ImageDraw.Draw(frame_img)
-                draw_kinetic_captions(
-                    draw, positioned_words, word_timings, current_time, duration, pose, accent, font_title
-                )
-
-            proc.stdin.write(frame_img.tobytes())
-            global_frame_counter += 1
-
-        proc.stdin.close()
-        proc.wait()
-        video_clips.append(output_scene)
-        elapsed_offset += duration
-
-    with open("inputs.txt", "w") as file:
-        for clip in video_clips:
-            file.write(f"file '{clip}'\n")
-
-    raw_merged = "raw_reel.mp4"
-    merge_cmd = [
-        FFMPEG_BIN, "-y",
-        "-f", "concat",
-        "-safe", "0",
-        "-i", "inputs.txt",
-        "-c", "copy",
-        raw_merged
-    ]
-    subprocess.run(merge_cmd, check=True)
-
-    bg_wav = generate_ambient_audio(scene_durations, "bg_audio.wav")
-    final_output = "final_reel.mp4"
-    mix_cmd = [
-        FFMPEG_BIN, "-y",
-        "-i", raw_merged,
-        "-i", bg_wav,
-        "-filter_complex", "[0:a]volume=1.15[v];[1:a]volume=1.0[bg];[v][bg]amix=inputs=2:duration=first:dropout_transition=2[aout]",
-        "-map", "0:v",
-        "-map", "[aout]",
-        "-c:v", "copy",
-        "-c:a", "aac",
-        "-b:a", "192k",
-        final_output
-    ]
-    subprocess.run(mix_cmd, check=True)
-
-    for clip in video_clips:
-        os.remove(clip)
-    for audio in audio_paths:
-        os.remove(audio)
-    for tmp in ["inputs.txt", raw_merged, bg_wav]:
-        if os.path.exists(tmp):
-            os.remove(tmp)
-
-    print(f"اكتمل بناء الفيديو النهائي بنجاح: {final_output}")
-    return final_output
+                print(f"✅ فيسبوك: «{r.get('name')}»")
+        except Exception as e:
+            ok = False
+            print(f"❌ فيسبوك: {str(e)[:150]}")
+    else:
+        print("⚪️ فيسبوك: بلا مفاتيح — سيبني الفيديو فقط")
+    print("\n" + ("✅ كل شي جاهز\n" if ok else "⚠️ أصلح ❌ ثم أعد الفحص\n"))
+    return 0 if ok else 1
 
 
-# 11. نشر الفيديو على بيج فيسبوك
-def publish_to_facebook(video_path, title, caption):
-    print("بدء عملية النشر على فيسبوك ريلز...")
-    if not FB_ACCESS_TOKEN or not FB_PAGE_ID:
-        print("خطأ: FB_ACCESS_TOKEN أو FB_PAGE_ID غير موجود في Secrets!")
-        sys.exit(1)
-
-    init_url = f"https://graph.facebook.com/v20.0/{FB_PAGE_ID}/video_reels"
-    init_params = {"access_token": FB_ACCESS_TOKEN, "upload_phase": "start"}
-    init_res = requests.post(init_url, params=init_params).json()
-    print("رد فيسبوك (مرحلة البدء):", init_res)
-
-    video_id = init_res.get("video_id")
-    upload_url = init_res.get("upload_url")
-
-    if not video_id or not upload_url:
-        print("فشل بدء جلسة الرفع! راجع صلاحيات التوكن أعلاه.")
-        sys.exit(1)
-
-    file_size = os.path.getsize(video_path)
-    headers = {
-        "Authorization": f"OAuth {FB_ACCESS_TOKEN}",
-        "offset": "0",
-        "file_size": str(file_size),
-        "Content-Type": "application/octet-stream"
-    }
-    with open(video_path, "rb") as f:
-        upload_res = requests.post(upload_url, headers=headers, data=f)
-    print("رد فيسبوك (مرحلة رفع الملف):", upload_res.status_code, upload_res.text)
-
-    publish_url = f"https://graph.facebook.com/v20.0/{FB_PAGE_ID}/video_reels"
-    publish_params = {
-        "access_token": FB_ACCESS_TOKEN,
-        "video_id": video_id,
-        "upload_phase": "finish",
-        "video_state": "PUBLISHED",
-        "title": title,
-        "description": caption
-    }
-    publish_res = requests.post(publish_url, params=publish_params).json()
-    print("رد فيسبوك (مرحلة النشر النهائي):", publish_res)
-
-    if publish_res.get("success") or "video_id" in publish_res:
-        print("تم نشر الريلز على صفحة فيسبوك بنجاح!")
-        return True
-
-    print("فشل النشر النهائي على فيسبوك!")
-    sys.exit(1)
-
-
-async def main():
-    page_name = get_page_name()
-    script_data = await generate_script()
-    final_video = await make_video(script_data, page_name)
-    publish_to_facebook(final_video, script_data["title"], script_data["caption"])
+def main():
+    global TOPIC
+    ap = argparse.ArgumentParser(description="ريلز ستيك مان — مجاني 100%")
+    ap.add_argument("--no-publish", action="store_true")
+    ap.add_argument("--topic", default=None)
+    ap.add_argument("--seed", type=int, default=None)
+    ap.add_argument("--out", default=None)
+    ap.add_argument("--check", action="store_true")
+    a = ap.parse_args()
+    if a.check:
+        return check()
+    if a.topic:
+        TOPIC = a.topic
+    if a.seed is not None:
+        import random
+        random.seed(a.seed)
+    ffmpeg()
+    log(f"مفاتيح: gemini={bool(GK)} groq={bool(GRK)} openrouter={bool(ORK)} fb={bool(FBT and FBP)}")
+    script, src = gen_script()
+    video = produce(script)
+    if a.out:
+        t = Path(a.out)
+        t.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(video, t)
+        video = t
+    cap = script["caption"] + ("\n\n" + " ".join(script["hashtags"]) if script["hashtags"] else "")
+    meta = {"title": script["title"], "caption": cap, "source": src, "video": str(video),
+            "duration_sec": round(duration(video), 2), "size_mb": round(video.stat().st_size / 1e6, 2),
+            "generated_at": datetime.now(timezone.utc).isoformat()}
+    rc = 0
+    if FBT and FBP and not a.no_publish:
+        try:
+            meta["permalink"] = publish(video, cap)
+            log(f"🎉 منشور: {meta['permalink']}")
+        except Exception as e:
+            log(f"❌ فشل النشر: {str(e)[:400]}")
+            rc = 1
+    else:
+        log("ℹ️ بلا نشر — الفيديو محفوظ")
+    (OUT / "meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(json.dumps({k: meta[k] for k in ("title", "source", "duration_sec", "size_mb")}, ensure_ascii=False))
+    return rc
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    sys.exit(main())
