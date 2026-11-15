@@ -41,7 +41,14 @@ def ffmpeg():
             import imageio_ffmpeg
             exe = imageio_ffmpeg.get_ffmpeg_exe()
         except Exception:
-            sys.exit("ffmpeg غير موجود: sudo apt-get install -y ffmpeg  أو  pip install imageio-ffmpeg")
+            log("⬇️  ffmpeg غير موجود — تنزيل نسخة مجانية (imageio-ffmpeg)…")
+            try:
+                subprocess.run([sys.executable, "-m", "pip", "install", "--quiet", "imageio-ffmpeg"], check=True)
+                import importlib, imageio_ffmpeg
+                importlib.invalidate_caches()
+                exe = imageio_ffmpeg.get_ffmpeg_exe()
+            except Exception as e:
+                sys.exit(f"ffmpeg غير موجود وتنزيله فشل ({type(e).__name__}). أضف imageio-ffmpeg لسطر pip install")
     FF = exe
     return exe
 
