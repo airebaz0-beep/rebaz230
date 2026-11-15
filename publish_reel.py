@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """ستيك مان ريلز — نسخة مضغوطة، كل الوظائف، مجانية 100%.
 المتطلبات: pip install requests pillow edge-tts imageio-ffmpeg
-الأسرار: FB_PAGE_ID, FB_ACCESS_TOKEN  (اختياري: GEMINI_API_KEY/GROQ_API_KEY/OPENROUTER_API_KEY)
+الأسرار: FB_PAGE_ID, FB_ACCESS_TOKEN, GEMINI_API_KEY
 ."""
 import argparse, asyncio, json, math, os, re, shutil, subprocess, sys, tempfile
 from datetime import datetime, timezone
@@ -20,6 +20,7 @@ TOPIC = E("TOPIC") or ""
 OUT = Path(E("OUT_DIR") or tempfile.gettempdir() + "/reel")
 GK, GRK, ORK = E("GEMINI_API_KEY") or "", E("GROQ_API_KEY") or "", E("OPENROUTER_API_KEY") or ""
 GMODEL = E("GEMINI_MODEL") or "gemini-2.5-flash"
+GMODEL_FALLBACK = "gemini-flash-latest"
 FBT, FBP = E("FB_ACCESS_TOKEN") or "", E("FB_PAGE_ID") or ""
 GRAPH = E("GRAPH_VERSION") or "v21.0"
 RAQM = features.check("raqm")
@@ -497,13 +498,36 @@ class R:
         return img
 
 
-# ───────────────────────── النص: AI ثم قوالب محلية ─────────────────────────
-SYS = """أنت كاتب ريلز لشخصية "ستيك مان". أعد JSON فقط:
-{"title":"عنوان قصير","caption":"وصف 1-2 جملة ينتهي بسؤال","hashtags":["#وسم"],
- "scenes":[{"text":"جملة قصيرة أقل من 90 حرف","mood":"walk","prop":"clock"}]}
-4-6 مشاهد. mood من: walk, talk, think, sad, happy, run, jump, point.
-prop من: none, clock, coins, plant, mountain, book, shadow, steps, hourglass, fire, heart, wall, trophy, star, mirror.
-المشهد الأول خطاف، الأخير خلاصة. بلا إيموجي ولا مواضيع سياسية أو دينية حساسة."""
+# ───────────────────────── النص: Gemini ثم بدائل ثم قوالب ─────────────────────────
+SYS = """أنت كاتب محتوى عربي محترف متخصص في ريلز فيسبوك القصيرة (شخصية ستيك مان مرسومة بخطوط).
+الهدف: فيديو 25-40 ثانية يخلي المشاهد يكمل للنهاية ويكتب تعليق.
+
+أعد **JSON فقط** بهذا الشكل (بلا شرح، بلا ```، بلا أي نص خارج JSON):
+{"title":"...","caption":"...","hashtags":["#..."],"scenes":[{"text":"...","mood":"walk","prop":"clock"}]}
+
+قواعد الكتابة (مهمة جداً):
+1) المشهد الأول = خطاف بأقل من 8 كلمات: سؤال صادم أو حقيقة معكوسة أو رقم. ممنوع المقدمات.
+2) كل مشهد فكرة واحدة، جملة واحدة، أقل من 85 حرف، بأسلوب منطوق طبيعي.
+3) استخدم تفاصيل ملموسة (أرقام، أوقات، أفعال) بدل الكلام العام.
+4) ممنوع العبارات المحفوظة: "لا تستسلم"، "ثق بنفسك"، "الحلم يبدأ بخطوة" — إلا بصياغة جديدة كلياً.
+5) ابنِ تصاعداً: مشكلة → إعادة تأطير مفاجئة → خطوة عملية صغيرة → خلاصة.
+6) المشهد الأخير: جملة قصيرة قابلة للحفظ. دعوة التفاعل تكون بالكابشن لا بالصوت.
+7) اللهجة: عربية مبسطة بلمسة عراقية خفيفة (شنو، هواية، چان) — بلا فصحى ثقيلة وبلا عامية أجنبية.
+8) الكابشن: سطران كحد أقصى وينتهي بسؤال قصير. الهاشتاقات: 4-6 عربية بصيغة #وسم_واحد.
+9) 5 أو 6 مشاهد بالضبط.
+10) mood لكل مشهد من: walk, talk, think, sad, happy, run, jump, point — ونوّع (لا تكرر نفس المزاج مرتين متتاليتين).
+11) prop = العنصر البصري الأقرب لمعنى الجملة من: none, clock, coins, plant, mountain, book, shadow, steps, hourglass, fire, heart, wall, trophy, star, mirror.
+12) بلا سياسة، بلا فتاوى دينية، بلا أشخاص حقيقيين، بلا وعود مالية.
+"""
+
+POOL = ["البداية قبل الجاهزية", "تأجيل الأشياء المهمة", "الانضباط بلا حماس", "الوقت الضائع بالهاتف",
+        "الخوف من رأي الناس", "المقارنة بالآخرين", "الاستمرار بلا نتيجة", "الراحة المسمومة",
+        "الكلام بدل العمل", "أول 5 دقائق من أي مهمة", "الصبر على التعلّم البطيء", "الرفض الذي ينفعك",
+        "التخطيط الزائد", "الفرص الصغيرة", "الاستسلام بعد نجاح قريب", "التركيز على شي واحد",
+        "المال والوقت", "الصحة كأصل", "العلاقات التي تسحبك", "الوحدة المنتجة",
+        "الصمت وقت الغضب", "التعلّم من الفشل السريع", "الكمال المؤجل", "روتين الصباح",
+        "شجاعة الاعتذار", "إغلاق الملفات القديمة", "أهمية الملل", "الحدود الشخصية",
+        "القراءة مقابل التمرير", "قرار صغير يومي"]
 
 TPL = [
  {"title": "البداية الصعبة", "caption": "كلنا مرينا بهذي اللحظة. صح لو لا؟", "hashtags": ["#تحفيز", "#ستيك_مان", "#ريلز"],
@@ -560,7 +584,13 @@ def validate(sc):
 def gen_script():
     import random
     topic = TOPIC.strip()
-    prompt = f"اكتب سكربت ريل باللغة {'العربية' if LANG_AR else 'English'}." + (f" الموضوع: {topic}." if topic else " اختر موضوعاً تحفيزياً جديداً.")
+    day = datetime.now(timezone.utc).timetuple().tm_yday
+    pick = topic or POOL[day % len(POOL)]
+    recent = "، ".join(POOL[(day - k) % len(POOL)] for k in (1, 2, 3))
+    prompt = (f"اكتب ريلاً جديداً باللغة {'العربية' if LANG_AR else 'English'}.\n"
+              f"موضوع اليوم: «{pick}».\n"
+              f"زوايا استُخدمت مؤخراً — لا تعيدها ولا تقترب منها: {recent}.\n"
+              f"اختر مدخلاً غير متوقع لهذا الموضوع واجعل الخطاف مفاجئاً.")
     srcs = []
     if GK:
         srcs.append(("gemini", lambda: js("".join(p.get("text", "") for p in __import__("requests").post(
@@ -747,6 +777,8 @@ def main():
         random.seed(a.seed)
     ffmpeg()
     log(f"مفاتيح: gemini={bool(GK)} groq={bool(GRK)} openrouter={bool(ORK)} fb={bool(FBT and FBP)}")
+    if not (GK or GRK or ORK):
+        log("⚠️  لا يوجد مفتاح AI → المحتوى من القوالب المحلية. أضف GEMINI_API_KEY لنتائج أقوى بكثير (مجاني).")
     script, src = gen_script()
     video = produce(script)
     if a.out:
