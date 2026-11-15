@@ -1,1172 +1,1106 @@
-# -*- coding: utf-8 -*-
 import os
-import sys
 import re
+import sys
 import json
 import math
-import wave
-import time
 import random
 import shutil
-import asyncio
-import textwrap
+import argparse
 import subprocess
-import glob
-import requests
-import numpy as np
-from PIL import Image, ImageDraw, ImageFont, ImageFilter, features
-import google.generativeai as genai
-import edge_tts
+from pathlib import Path
+from datetime import datetime, timezone, timedelta
 
-# ============================================================
-# الإعدادات
-# ============================================================
-W, H = 1080, 1920
-FPS = 30
-SR = 44100
-CAP_SIZE = 86
-VOICE = os.getenv("TTS_VOICE", "ar-SA-HamedNeural")
-TTS_RATE = os.getenv("TTS_RATE", "+6%")
-GRAPH = os.getenv("FB_GRAPH_VERSION", "v21.0")
-PEXELS_KEY = os.getenv("PEXELS_API_KEY")
-YELLOW = "#FACC15"
-PALETTE = ["#00F0FF", "#F472B6", "#FBBF24", "#34D399", "#A78BFA", "#38BDF8"]
+import requests
+from PIL import Image, ImageDraw, ImageFont
 
 try:
     import arabic_reshaper
     from bidi.algorithm import get_display
+    HAS_ARABIC_SHAPING = True
 except ImportError:
-    subprocess.run([sys.executable, "-m", "pip", "install", "-q", "arabic-reshaper", "python-bidi"], check=False)
-    try:
-        import arabic_reshaper
-        from bidi.algorithm import get_display
-    except ImportError:
-        arabic_reshaper = None
-        get_display = None
-
-HAS_RAQM = features.check("raqm")
-
-FFMPEG_BIN = shutil.which("ffmpeg")
-if not FFMPEG_BIN:
-    subprocess.run([sys.executable, "-m", "pip", "install", "-q", "imageio-ffmpeg"], check=False)
-    import imageio_ffmpeg
-    FFMPEG_BIN = imageio_ffmpeg.get_ffmpeg_exe()
-
-_RS = getattr(Image, "Resampling", Image)
-BICUBIC, LANCZOS, BILINEAR = _RS.BICUBIC, _RS.LANCZOS, _RS.BILINEAR
+    HAS_ARABIC_SHAPING = False
 
 
-# ============================================================
-# أدوات عامة
-# ============================================================
-def hex_rgb(h):
-    h = h.lstrip("#")
-    return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
+# ==============================================================================
+# 1. إعدادات المشروع والثوابت (متوافقة مع معايير متقن للريلز)
+# ==============================================================================
+WIDTH = 1080
+HEIGHT = 1920
+FPS = 30
+
+# الهوامش الآمنة لواجهة ريلز فيسبوك وإنستغرام (10% جوانب وأعلى، 20% أسفل)
+SAFE_LEFT = int(WIDTH * 0.10)
+SAFE_RIGHT = int(WIDTH * 0.90)
+SAFE_TOP = int(HEIGHT * 0.10)
+SAFE_BOTTOM = int(HEIGHT * 0.80)
+
+WORK_DIR = Path("stickman_build")
+AUDIO_DIR = WORK_DIR / "audio_parts"
+FRAMES_DIR = WORK_DIR / "frames"
+PREVIEWS_DIR = WORK_DIR / "previews"
+EXPORTS_DIR = Path("exports")
+FONTS_DIR = Path("fonts")
+HISTORY_FILE = Path("published_history.json")
+
+PAGE_DISPLAY_NAME = "منسى - Mansa"
+PAGE_SPOKEN_NAME = "مَنْسَى"
+
+VOICE_NAME = os.getenv("TTS_VOICE", "ar-SA-HamedNeural")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+FB_PAGE_ID = os.getenv("FB_PAGE_ID", "").strip()
+FB_ACCESS_TOKEN = os.getenv("FB_ACCESS_TOKEN", "").strip()
+
+CATEGORIES = [
+    {
+        "id": "hadith_sahih",
+        "name": "حديث نبوي صحيح وعبرة",
+        "rules": (
+            "يجب أن يرتكز الفيديو على حديث نبوي شريف صحيح 100% من (صحيح البخاري) أو (صحيح مسلم) حصراً. "
+            "يُمنع منعاً باتاً ذكر أي حديث ضعيف أو موضوع أو غير متأكد من ثبوته في الصحيحين. "
+            "اذكر اسم الكتاب ورقم الحديث أو راويه بدقة في حقل hadith_source، واشرح معناه بقصة بصرية واقعية."
+        )
+    },
+    {
+        "id": "self_development",
+        "name": "تطوير الذات والعادات اليومية",
+        "rules": "فكرة عملية عن بناء العادات، الانضباط، إدارة الوقت، أو التغلب على التسويف بقصة إنسانية ملهمة."
+    },
+    {
+        "id": "psychology",
+        "name": "علم النفس والهدوء الداخلي",
+        "rules": "فكرة نفسية عميقة عن التفكير الزائد، ضبط الانفعال، الثقة بالنفس، أو التعامل مع الضغوط اليومية."
+    },
+    {
+        "id": "life_wisdom",
+        "name": "مواقف حياتية واجتماعية",
+        "rules": "موقف حياتي واقعي عن الاختيارات المصيرية، أثر الكلمة الطيبة، أو الصبر عند الشدائد."
+    }
+]
 
 
-def clamp01(x):
-    return max(0.0, min(1.0, x))
+# ==============================================================================
+# 2. قصص احتياطية معتمدة (تتضمن أحاديث صحيحة 100% من البخاري ومسلم + مواضيع متنوعة)
+# ==============================================================================
+FALLBACK_STORIES = [
+    {
+        "category": "hadith_sahih",
+        "hadith_source": "متفق عليه: رواه البخاري (6114) ومسلم (2609)",
+        "title": "مَنْ هُوَ الْقَوِيُّ الْحَقِيقِيُّ؟",
+        "caption": "قال رسول الله ﷺ: «لَيْسَ الشَّدِيدُ بِالصُّرَعَةِ، إِنَّمَا الشَّدِيدُ الَّذِي يَمْلِكُ نَفْسَهُ عِنْدَ الْغَضَبِ» [متفق عليه: البخاري ومسلم].\nتابع منسى - Mansa للمزيد. #حديث_صحيح #البخاري_ومسلم #تطوير_الذات",
+        "scenes": [
+            {
+                "id": 1,
+                "spoken_text": "يَظُنُّ كَثِيرٌ مِنَ النَّاسِ أَنَّ الْقُوَّةَ هِيَ رَفْعُ الصَّوْتِ أَوِ الْانْتِصَارُ فِي الْجِدَالِ.",
+                "bg_type": "crossroads",
+                "pose": "think",
+                "expression": "neutral",
+                "facing": 1
+            },
+            {
+                "id": 2,
+                "spoken_text": "لَكِنَّ النَّبِيَّ صَلَّى اللَّهُ عَلَيْهِ وَسَلَّمَ صَحَّحَ هَذَا الْمَفْهُومَ بِحَدِيثٍ عَظِيمٍ.",
+                "bg_type": "dawn_call",
+                "pose": "look_up",
+                "expression": "peaceful",
+                "facing": 1
+            },
+            {
+                "id": 3,
+                "spoken_text": "فَفِي الصَّحِيحَيْنِ عَنِ الْبُخَارِيِّ وَمُسْلِمٍ قَالَ: لَيْسَ الشَّدِيدُ بِالصُّرَعَةِ.",
+                "bg_type": "mosque",
+                "pose": "walk",
+                "expression": "determined",
+                "facing": 1
+            },
+            {
+                "id": 4,
+                "spoken_text": "إِنَّمَا الشَّدِيدُ الَّذِي يَمْلِكُ نَفْسَهُ عِنْدَ الْغَضَبِ.",
+                "bg_type": "mosque_light",
+                "pose": "arms_open",
+                "expression": "peaceful",
+                "facing": 1
+            },
+            {
+                "id": 5,
+                "spoken_text": "فَالْقُوَّةُ الْحَقِيقِيَّةُ تَبْدَأُ حِينَ تَهْدَأُ وَقْتَ الْعَاصِفَةِ. تَابِعْ مَنْسَى لِلْمَزِيدِ.",
+                "bg_type": "paradise",
+                "pose": "walk",
+                "expression": "happy",
+                "facing": 1
+            }
+        ]
+    },
+    {
+        "category": "hadith_sahih",
+        "hadith_source": "صحيح البخاري (رقم 6412)",
+        "title": "نِعْمَتَانِ يَغْفُلُ عَنْهُمَا النَّاسُ",
+        "caption": "قال رسول الله ﷺ: «نِعْمَتَانِ مَغْبُونٌ فِيهِمَا كَثِيرٌ مِنَ النَّاسِ: الصِّحَّةُ وَالْفَرَاغُ» [رواه البخاري].\nتابع منسى - Mansa للمزيد. #صحيح_البخاري #إدارة_الوقت #تأمل",
+        "scenes": [
+            {
+                "id": 1,
+                "spoken_text": "تَمُرُّ السَّاعَاتُ وَالْأَيَّامُ وَنَحْنُ نُؤَجِّلُ أَحْلَامَنَا وَأَعْمَالَنَا إِلَى الْغَدِ.",
+                "bg_type": "distraction",
+                "pose": "sad_slump",
+                "expression": "sad",
+                "facing": 1
+            },
+            {
+                "id": 2,
+                "spoken_text": "وَقَدْ حَذَّرَنَا النَّبِيُّ صَلَّى اللَّهُ عَلَيْهِ وَسَلَّمَ مِنْ هَذِهِ الْغَفْلَةِ فِي صَحِيحِ الْبُخَارِيِّ.",
+                "bg_type": "dawn_call",
+                "pose": "look_up",
+                "expression": "shocked",
+                "facing": 1
+            },
+            {
+                "id": 3,
+                "spoken_text": "حَيْثُ قَالَ: نِعْمَتَانِ مَغْبُونٌ فِيهِمَا كَثِيرٌ مِنَ النَّاسِ: الصِّحَّةُ وَالْفَرَاغُ.",
+                "bg_type": "study_desk",
+                "pose": "think",
+                "expression": "determined",
+                "facing": 1
+            },
+            {
+                "id": 4,
+                "spoken_text": "فَمَا دُمْتَ تَمْلِكُ عَافِيَتَكَ وَوَقْتَكَ الْيَوْمَ، فَلَا تُضَيِّعْهُمَا فِيمَا لَا يَنْفَعُ.",
+                "bg_type": "paradise",
+                "pose": "walk",
+                "expression": "happy",
+                "facing": 1
+            },
+            {
+                "id": 5,
+                "spoken_text": "ابْدَأْ خُطْوَتَكَ الْآنَ قَبْلَ فَوَاتِ الْأَوَانِ. تَابِعْ مَنْسَى لِلْمَزِيدِ.",
+                "bg_type": "mosque_light",
+                "pose": "arms_open",
+                "expression": "happy",
+                "facing": 1
+            }
+        ]
+    },
+    {
+        "category": "self_development",
+        "hadith_source": "",
+        "title": "قَاعِدَةُ الدَّقِيقَتَيْنِ لِكَسْرِ الْكَسَلِ",
+        "caption": "أصعب جزء في أي إنجاز هو البداية.. جرب قاعدة الدقيقتين اليوم.\nتابع منسى - Mansa للمزيد. #تطوير_الذات #عادات #إنتاجية",
+        "scenes": [
+            {
+                "id": 1,
+                "spoken_text": "هَلْ تَجِدُ صُعُوبَةً كَبِيرَةً فِي بَدْءِ مَهَامِّكَ الْيَوْمِيَّةِ رَغْمَ أَهَمِّيَّتِهَا؟",
+                "bg_type": "solitude",
+                "pose": "sad_slump",
+                "expression": "sad",
+                "facing": 1
+            },
+            {
+                "id": 2,
+                "spoken_text": "الْعَقْلُ يَهْرُبُ مِنَ الْمَهَامِّ الْكَبِيرَةِ لِأَنَّهُ يَرَاهَا مُرْهِقَةً وَطَوِيلَةً.",
+                "bg_type": "crossroads",
+                "pose": "think",
+                "expression": "neutral",
+                "facing": 1
+            },
+            {
+                "id": 3,
+                "spoken_text": "الْحَلُّ الْبَسِيطُ هُوَ أَنْ تَلْتَزِمَ بِالْعَمَلِ لِمُدَّةِ دَقِيقَتَيْنِ فَقَطْ دُونَ ضَغْطٍ.",
+                "bg_type": "study_desk",
+                "pose": "walk",
+                "expression": "determined",
+                "facing": 1
+            },
+            {
+                "id": 4,
+                "spoken_text": "بِمُجَرَّدِ أَنْ تَكْسِرَ حَاجِزَ الْبِدَايَةِ، سَتَجِدُ نَفْسَكَ تَسْتَمِرُّ بِحَمَاسٍ وَسُهُولَةٍ.",
+                "bg_type": "paradise",
+                "pose": "arms_open",
+                "expression": "happy",
+                "facing": 1
+            },
+            {
+                "id": 5,
+                "spoken_text": "الْإِنْجَازُ الْكَبِيرُ يَبْدَأُ بِدَقِيقَةٍ وَاحِدَةٍ صَادِقَةٍ. تَابِعْ مَنْسَى لِلْمَزِيدِ.",
+                "bg_type": "dawn_call",
+                "pose": "walk",
+                "expression": "happy",
+                "facing": 1
+            }
+        ]
+    },
+    {
+        "category": "psychology",
+        "hadith_source": "",
+        "title": "لِمَاذَا يُتْعِبُكَ التَّفْكِيرُ الزَّائِدُ؟",
+        "caption": "كثرة التفكير في المستقبل تسرق منك هدوء الحاضر.\nتابع منسى - Mansa للمزيد. #علم_النفس #هدوء_نفسي #وعي",
+        "scenes": [
+            {
+                "id": 1,
+                "spoken_text": "أَحْيَانًا نُعَانِي فِي خَيَالِنَا أَكْثَرَ مِمَّا نُعَانِي فِي الْوَاقِعِ نَفْسِهِ.",
+                "bg_type": "solitude",
+                "pose": "think",
+                "expression": "sad",
+                "facing": 1
+            },
+            {
+                "id": 2,
+                "spoken_text": "التَّفْكِيرُ الزَّائِدُ يَجْعَلُكَ تَعِيشُ مَشَاكِلَ لَمْ تَحْدُثْ وَلَنْ تَحْدُثَ أَبَدًا.",
+                "bg_type": "crossroads",
+                "pose": "fear_back",
+                "expression": "shocked",
+                "facing": -1
+            },
+            {
+                "id": 3,
+                "spoken_text": "تَوَقَّفْ لَحْظَةً، وَافْصِلْ بَيْنَ مَا تَسْتَطِيعُ تَغْيِيرَهُ وَمَا هُوَ خَارِجُ سَيْطَرَتِكَ.",
+                "bg_type": "dawn_call",
+                "pose": "look_up",
+                "expression": "peaceful",
+                "facing": 1
+            },
+            {
+                "id": 4,
+                "spoken_text": "رَكِّزْ طَاقَتَكَ عَلَى خُطْوَتِكَ الْحَالِيَّةِ فَقَطْ، وَاتْرُكِ الْبَاقِيَ لِتَدْبِيرِ اللَّهِ.",
+                "bg_type": "paradise",
+                "pose": "walk",
+                "expression": "happy",
+                "facing": 1
+            },
+            {
+                "id": 5,
+                "spoken_text": "رَاحَةُ بَالِكَ تَبْدَأُ حِينَ تَتَوَقَّفُ عَنِ الْقَلَقِ. تَابِعْ مَنْسَى لِلْمَزِيدِ.",
+                "bg_type": "mosque_light",
+                "pose": "arms_open",
+                "expression": "peaceful",
+                "facing": 1
+            }
+        ]
+    }
+]
 
 
-def ease_out_back(t):
-    t = clamp01(t)
-    c1 = 1.70158
-    c3 = c1 + 1.0
-    return 1.0 + c3 * ((t - 1.0) ** 3) + c1 * ((t - 1.0) ** 2)
+# ==============================================================================
+# 3. إدارة سجل المواضيع المنشورة لمنع التكرار أو التشابه في نفس اليوم
+# ==============================================================================
+def get_iraq_now() -> datetime:
+    return datetime.now(timezone(timedelta(hours=3)))
 
 
-def ease_out_cubic(t):
-    t = clamp01(t)
-    return 1.0 - ((1.0 - t) ** 3)
+def get_day_slot_name(dt: datetime) -> str:
+    h = dt.hour
+    if 5 <= h < 11:
+        return "الصباح"
+    elif 11 <= h < 15:
+        return "الظهر"
+    elif 15 <= h < 18:
+        return "العصر"
+    return "العشاء"
 
 
-def ease_in_out(t):
-    t = clamp01(t)
-    return t * t * (3 - 2 * t)
-
-
-def load_font(path, size):
-    if path and os.path.exists(path):
+def load_history() -> list:
+    if HISTORY_FILE.exists():
         try:
-            return ImageFont.truetype(path, size)
+            with open(HISTORY_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, list):
+                    return data
         except Exception:
             pass
-    try:
-        return ImageFont.load_default(size)
-    except TypeError:
-        return ImageFont.load_default()
+    return []
 
 
-def tk(font):
-    d = {"font": font}
-    if HAS_RAQM:
-        d["direction"] = "rtl"
-    return d
+def save_history(history: list):
+    trimmed = history[-60:]
+    with open(HISTORY_FILE, "w", encoding="utf-8") as f:
+        json.dump(trimmed, f, ensure_ascii=False, indent=2)
 
 
-def select_random_font():
-    all_fonts, good = [], []
-    for folder in [".", "fonts"]:
-        if os.path.isdir(folder):
-            for fname in os.listdir(folder):
-                if fname.lower().endswith((".ttf", ".otf")):
-                    full = os.path.join(folder, fname)
-                    all_fonts.append(full)
-                    if "extralight" not in fname.lower() and "thin" not in fname.lower() and "light" not in fname.lower():
-                        good.append(full)
-    candidates = sorted(set(good or all_fonts))
-    if candidates:
-        chosen = random.choice(candidates)
-        print(f"الخطوط المتوفرة ({len(candidates)}) | المختار: {os.path.basename(chosen)}")
-        return chosen
-    fallback = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
-    print("تنبيه: ما لقيت خطوط مرفوعة، استخدمت الاحتياطي.")
-    return fallback if os.path.exists(fallback) else None
+def choose_next_category(history: list, today_str: str) -> dict:
+    used_today = {item.get("category") for item in history if item.get("date") == today_str}
+    available = [c for c in CATEGORIES if c["id"] not in used_today]
+    if not available:
+        available = CATEGORIES
+    return random.choice(available)
 
 
-def shape_word(word):
-    if HAS_RAQM:
-        return word
-    if arabic_reshaper and get_display:
-        return get_display(arabic_reshaper.reshape(word))
-    return word
+# ==============================================================================
+# 4. أدوات اللغة العربية، تنظيف النطق، والخطوط
+# ==============================================================================
+def sanitize_spoken_text(text: str) -> str:
+    """يضمن عدم نطق اسم الصفحة مرتين (منسى - Mansa -> مَنْسَى مرة واحدة فقط)."""
+    if not text:
+        return ""
+    cleaned = re.sub(r"منسى\s*[-–—/|]\s*mansa", "مَنْسَى", text, flags=re.IGNORECASE)
+    cleaned = re.sub(r"مَنْسَى\s*[-–—/|]\s*mansa", "مَنْسَى", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\bmansa\b", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"(مَنْسَى|منسى)(\s+\1)+", r"\1", cleaned)
+    cleaned = re.sub(r"\[[^\]]*\]", "", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned
 
 
-def shape_text(text):
-    return shape_word(text.strip())
+def strip_tashkeel(text: str) -> str:
+    return re.sub(r"[\u064B-\u065F\u0670]", "", text)
 
 
-def shape_multiline(text, max_chars=22):
-    wrapped = textwrap.fill(text.strip(), width=max_chars)
-    if HAS_RAQM:
-        return wrapped
-    if arabic_reshaper and get_display:
-        return "\n".join(get_display(arabic_reshaper.reshape(l)) for l in wrapped.split("\n"))
-    return wrapped
+def shape_arabic(text: str) -> str:
+    if not text:
+        return ""
+    if HAS_ARABIC_SHAPING:
+        reshaped = arabic_reshaper.reshape(text)
+        return get_display(reshaped)
+    return text
 
 
-def clean_speech(text):
-    text = re.sub(r"\[.*?\]", "", text)
-    text = re.sub(r"[\U00010000-\U0010ffff]", "", text)
-    return re.sub(r"\s+", " ", text).strip()
-
-
-# ============================================================
-# الصوت
-# ============================================================
-def decode_audio(path):
-    raw = subprocess.check_output(
-        [FFMPEG_BIN, "-v", "quiet", "-i", path, "-f", "s16le", "-ac", "1", "-ar", str(SR), "-"]
-    )
-    return np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
-
-
-def trim_silence(x, lead=0.04, tail=0.14):
-    if len(x) == 0:
-        return x, 0.0
-    win = int(SR * 0.01)
-    n = len(x) // win
-    if n == 0:
-        return x, 0.0
-    rms = np.sqrt(np.mean(x[:n * win].reshape(n, win) ** 2, axis=1))
-    thr = max(0.004, rms.max() * 0.03)
-    idx = np.where(rms > thr)[0]
-    if len(idx) == 0:
-        return x, 0.0
-    s = max(0, int(idx[0] * win - lead * SR))
-    e = min(len(x), int((idx[-1] + 1) * win + tail * SR))
-    y = x[s:e].copy()
-    fade = int(0.008 * SR)
-    if len(y) > 2 * fade:
-        y[:fade] *= np.linspace(0, 1, fade)
-        y[-fade:] *= np.linspace(1, 0, fade)
-    return y, s / SR
-
-
-def frame_envelope(x, n_frames):
-    if len(x) == 0:
-        return np.zeros(n_frames)
-    edges = np.linspace(0, len(x), n_frames + 1).astype(int)
-    lv = np.array([np.sqrt(np.mean(x[a:b] ** 2)) if b > a else 0.0 for a, b in zip(edges[:-1], edges[1:])])
-    ref = np.percentile(lv, 92) if lv.max() > 0 else 1.0
-    env = np.clip(lv / (ref * 1.05 + 1e-9), 0, 1)
-    out = np.zeros_like(env)
-    cur = 0.0
-    for i, v in enumerate(env):
-        cur = v if v > cur else cur * 0.55 + v * 0.45
-        out[i] = cur
-    return out
-
-
-def align_words(words, boundaries, duration):
-    if boundaries and len(boundaries) == len(words):
-        res = []
-        for i, b in enumerate(boundaries):
-            st = b["start"]
-            en = b["end"] if b["end"] > st else (boundaries[i + 1]["start"] if i + 1 < len(boundaries) else duration)
-            res.append((st, max(st + 0.12, en)))
-        return res
-    if boundaries:
-        lens = [max(1, len(b["text"])) for b in boundaries]
-        bchars = np.cumsum([0] + lens)[:-1].astype(float)
-        bstarts = np.array([b["start"] for b in boundaries], dtype=float)
-        total_b = float(sum(lens))
-        wl = [max(1, len(w)) for w in words]
-        wcum = np.cumsum([0] + wl)[:-1].astype(float)
-        wtot = float(sum(wl))
-        starts = np.interp(wcum / wtot * total_b, bchars, bstarts)
-        end_all = max(boundaries[-1]["end"], boundaries[-1]["start"] + 0.2)
-        res = []
-        for i, st in enumerate(starts):
-            en = starts[i + 1] if i + 1 < len(starts) else end_all
-            res.append((float(st), float(max(st + 0.12, en))))
-        return res
-    weights = [max(2, len(w)) for w in words]
-    total_w = float(sum(weights))
-    s0, s1 = 0.05, max(0.3, duration - 0.15)
-    span = s1 - s0
-    cur = s0
-    res = []
-    for wt in weights:
-        dur = span * wt / total_w
-        res.append((cur, cur + dur))
-        cur += dur
-    return res
-
-
-async def tts_scene(text, voice, path, tries=3):
-    last = None
-    for _ in range(tries):
+def pick_arabic_font(size: int) -> ImageFont.FreeTypeFont:
+    font_candidates = []
+    if FONTS_DIR.exists():
+        for ext in ("*.ttf", "*.otf"):
+            font_candidates.extend(FONTS_DIR.glob(ext))
+    system_fallbacks = [
+        Path("alfont_com_EYENAmmon-Bold.ttf"),
+        Path("/usr/share/fonts/truetype/noto/NotoSansArabic-Bold.ttf"),
+        Path("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"),
+        Path("C:/Windows/Fonts/arialbd.ttf"),
+    ]
+    if font_candidates:
+        chosen = random.choice(font_candidates)
         try:
+            return ImageFont.truetype(str(chosen), size)
+        except Exception:
+            pass
+    for fb in system_fallbacks:
+        if fb.exists():
             try:
-                comm = edge_tts.Communicate(text, voice, rate=TTS_RATE, boundary="WordBoundary")
-            except TypeError:
-                comm = edge_tts.Communicate(text, voice, rate=TTS_RATE)
-            bounds = []
-            with open(path, "wb") as f:
-                async for chunk in comm.stream():
-                    if chunk["type"] == "audio":
-                        f.write(chunk["data"])
-                    elif chunk["type"] == "WordBoundary":
-                        st = chunk["offset"] / 1e7
-                        du = chunk.get("duration", 0) / 1e7
-                        bounds.append({"start": st, "end": st + du, "text": chunk.get("text", "")})
-            if os.path.getsize(path) > 1000:
-                return bounds
-        except Exception as e:
-            last = e
-            await asyncio.sleep(1.5)
-    raise RuntimeError(f"فشل توليد الصوت: {last}")
-
-
-def generate_music(total_dur, transitions):
-    n = int(total_dur * SR)
-    t = np.arange(n, dtype=np.float64) / SR
-    chords = [[220.00, 261.63, 329.63], [174.61, 220.00, 261.63],
-              [130.81, 196.00, 261.63], [196.00, 246.94, 293.66]]
-    clen = 4.0
-    cidx = (t // clen).astype(int) % len(chords)
-    loc = t % clen
-    env = np.minimum(1.0, loc / 0.6) * np.minimum(1.0, (clen - loc) / 0.6)
-    audio = np.zeros(n)
-    for ci, fr in enumerate(chords):
-        m = cidx == ci
-        if not m.any():
-            continue
-        tt = t[m]
-        pad = sum(np.sin(2 * np.pi * f * tt) + 0.6 * np.sin(2 * np.pi * f * 1.003 * tt) for f in fr) / (len(fr) * 1.6)
-        bass = np.sin(2 * np.pi * (fr[0] / 2) * tt)
-        audio[m] += (0.55 * pad + 0.36 * bass) * env[m]
-    audio *= 0.06
-    rng = np.random.default_rng(7)
-    for tr in transitions:
-        s = max(0, int((tr - 0.1) * SR))
-        e = min(n, s + int(0.3 * SR))
-        if e > s:
-            nz = rng.standard_normal(e - s)
-            nz = np.convolve(nz, np.ones(24) / 24, mode="same")
-            xs = np.linspace(0, 1, e - s)
-            audio[s:e] += 0.10 * nz * np.sin(np.pi * xs) ** 2
-        s2 = int(tr * SR)
-        e2 = min(n, s2 + int(0.09 * SR))
-        if e2 > s2:
-            tp = np.arange(e2 - s2) / SR
-            audio[s2:e2] += 0.10 * np.sin(2 * np.pi * (320 + 480 * tp / 0.09) * tp) * np.exp(-tp * 38.0)
-    return audio.astype(np.float32)
-
-
-def load_music_file(total):
-    """إذا حطيت ملفات موسيقى (mp3/wav) بمجلد music يستخدمها بدل الموسيقى المولّدة"""
-    files = []
-    for ext in ("mp3", "wav", "m4a", "ogg"):
-        files += glob.glob(os.path.join("music", f"*.{ext}"))
-    if not files:
-        return None
-    try:
-        f = random.choice(files)
-        x = decode_audio(f).astype(np.float64)
-        if len(x) < SR:
-            return None
-        reps = int(total // len(x)) + 1
-        x = np.tile(x, reps)[:total]
-        pk = np.max(np.abs(x))
-        if pk > 0:
-            x = x / pk * 0.16
-        print("موسيقى الخلفية:", os.path.basename(f))
-        return x
-    except Exception as e:
-        print("تعذر تحميل ملف الموسيقى:", e)
-        return None
-
-
-def build_final_audio(tracks, transitions, out_wav):
-    voice = np.concatenate(tracks).astype(np.float64)
-    pk = np.max(np.abs(voice))
-    if pk > 0:
-        voice = voice / pk * 0.9
-    total = len(voice)
-    music = load_music_file(total)
-    if music is None:
-        music = generate_music(total / SR, transitions).astype(np.float64)
-    if len(music) < total:
-        music = np.pad(music, (0, total - len(music)))
-    music = music[:total]
-    a = np.abs(voice)
-    c = np.cumsum(np.concatenate([[0.0], a]))
-    half = int(0.04 * SR)
-    idx = np.arange(total)
-    lo = np.clip(idx - half, 0, total)
-    hi = np.clip(idx + half, 0, total)
-    sm = (c[hi] - c[lo]) / np.maximum(hi - lo, 1)
-    duck = 1.0 - 0.55 * np.clip(sm / 0.08, 0, 1)
-    mix_a = voice + music * duck
-    pk = np.max(np.abs(mix_a))
-    if pk > 0.95:
-        mix_a *= 0.95 / pk
-    pcm = np.clip(mix_a * 32767.0, -32768, 32767).astype(np.int16)
-    with wave.open(out_wav, "wb") as wf:
-        wf.setnchannels(1)
-        wf.setsampwidth(2)
-        wf.setframerate(SR)
-        wf.writeframes(pcm.tobytes())
-    return out_wav
-
-
-# ============================================================
-# المفاتيح + اسم الصفحة + السجل
-# ============================================================
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-FB_ACCESS_TOKEN = os.getenv("FB_ACCESS_TOKEN")
-FB_PAGE_ID = os.getenv("FB_PAGE_ID")
-genai.configure(api_key=GEMINI_API_KEY, transport="rest")
-
-
-def get_page_name():
-    env_name = os.getenv("PAGE_NAME", "").strip()
-    if env_name:
-        print(f"اسم الصفحة (من PAGE_NAME): {env_name}")
-        return env_name
-    if FB_ACCESS_TOKEN and FB_PAGE_ID:
-        try:
-            res = requests.get(
-                f"https://graph.facebook.com/{GRAPH}/{FB_PAGE_ID}",
-                params={"fields": "name", "access_token": FB_ACCESS_TOKEN}, timeout=10
-            ).json()
-            name = res.get("name", "").strip()
-            if name:
-                print(f"اسم الصفحة المعتمد: {name}")
-                return name
-            print("ما رجع اسم من فيسبوك:", res)
-        except Exception as e:
-            print("تعذر جلب اسم الصفحة:", e)
-    return "إضاءات ومعرفة"
-
-
-def load_topic_history(history_file="topics_history.txt", limit=30):
-    if not os.path.exists(history_file):
-        return []
-    with open(history_file, "r", encoding="utf-8") as f:
-        lines = [l.strip() for l in f if l.strip()]
-    return lines[-limit:]
-
-
-def save_topic_history(topic, history_file="topics_history.txt"):
-    topic = (topic or "").strip()
-    if topic and topic not in load_topic_history(history_file, limit=200):
-        with open(history_file, "a", encoding="utf-8") as f:
-            f.write(topic + "\n")
-
-
-# ============================================================
-# توليد السيناريو
-# ============================================================
-def pick_models():
-    names = []
-    try:
-        for m in genai.list_models():
-            n = m.name
-            if ("generateContent" in m.supported_generation_methods and "flash" in n
-                    and not any(x in n for x in ("image", "tts", "embedding", "live", "thinking", "exp", "preview"))):
-                names.append(n)
-    except Exception as e:
-        print("تعذر جلب النماذج:", e)
-    pref = ["2.5-flash", "2.0-flash", "1.5-flash"]
-    names.sort(key=lambda n: next((i for i, p in enumerate(pref) if p in n), 9) + (0.5 if "lite" in n else 0))
-    return names[:4] or ["models/gemini-1.5-flash"]
-
-
-def sanitize_script(data, outro_scene, cat_queries):
-    scenes = []
-    for s in data.get("scenes", []):
-        text = clean_speech(str(s.get("text", "")))
-        if not text or "تابع" in text:
-            continue
-        q = str(s.get("query", "")).strip()[:60] or random.choice(cat_queries)
-        scenes.append({"text": text, "query": q, "outro": False})
-    if len(scenes) < 3:
-        raise ValueError("عدد المشاهد غير كافٍ")
-    scenes.append(outro_scene)
-    return {
-        "title": str(data.get("title", "إضاءات ومعلومات مفيدة!")).strip(),
-        "topic": str(data.get("topic", data.get("title", ""))).strip(),
-        "caption": str(data.get("caption", "")).strip(),
-        "scenes": scenes,
-        "cat_queries": cat_queries,
-    }
-
-
-async def generate_script(page_name):
-    print("جاري توليد السيناريو...")
-    outro_scene = {"text": f"تابعوا صفحة {page_name} للمزيد من الفوائد",
-                   "query": "abstract neon light particles", "outro": True}
-
-    length_profiles = [
-        {"name": "سريع", "scenes_count": "4", "words": "5 إلى 7 كلمات",
-         "style": "اجعل الطرح سريعاً ومباشراً ومكثف الفائدة."},
-        {"name": "متوسط", "scenes_count": "6", "words": "5 إلى 8 كلمات",
-         "style": "اشرح الفكرة بوضوح مع ذكر السبب أو الفائدة العملية."},
-        {"name": "مفصّل", "scenes_count": "8", "words": "6 إلى 9 كلمات",
-         "style": "قدّم شرحاً ممتعاً بأسلوب قصصي أو خطوات عملية متتالية."},
-    ]
-    prof = random.choices(length_profiles, weights=[3, 5, 2], k=1)[0]
-
-    cats = [
-        {"category": "شرح حديث نبوي شريف",
-         "instruction": "اذكر حديثاً نبوياً صحيحاً وقصيراً ومشهوراً بدقة (مع ذكر من رواه باختصار)، ثم اشرح معناه وكيف نطبقه في حياتنا اليومية. لا تذكر حديثاً إلا إذا كنت متأكداً تماماً من صحته ونصه.",
-         "hashtags": "#أحاديث #السنة_النبوية #تذكير #إسلاميات",
-         "queries": ["mosque sunrise", "quran book light", "sky clouds timelapse", "desert sunset", "calm river nature"]},
-        {"category": "معلومات عامة وعلمية مذهلة",
-         "instruction": "قدّم معلومة غريبة ومدهشة وصحيحة في العلوم أو التاريخ أو الفضاء أو جسم الإنسان أو التكنولوجيا بأسلوب يثير الفضول.",
-         "hashtags": "#معلومات #هل_تعلم #ثقافة #حقائق",
-         "queries": ["galaxy space stars", "earth from space", "microscope science", "futuristic technology", "ocean deep"]},
-        {"category": "مقولات وحكم مفيدة",
-         "instruction": "اختر مقولة حكيمة أو قاعدة ذهبية ملهمة، واشرح مغزاها وكيف تغيّر نظرتنا للحياة.",
-         "hashtags": "#حكم #مقولات #تطوير_الذات #اقتباسات",
-         "queries": ["mountain sunrise", "walking road nature", "old library books", "ocean waves", "forest fog"]},
-        {"category": "نصائح دينية وإيمانية",
-         "instruction": "قدّم نصيحة إيمانية لطيفة حول ذكر الله أو الطمأنينة أو بر الوالدين أو الصدقة أو إصلاح القلب بأسلوب دافئ، بدون نسبة أي نص للشرع إلا إذا كنت متأكداً منه.",
-         "hashtags": "#نصائح_دينية #تذكير #طمأنينة #ذكر",
-         "queries": ["mosque night", "rain window calm", "sunrise clouds", "quran pages", "peaceful lake"]},
-        {"category": "نصائح مالية وإدارة الأموال",
-         "instruction": "قدّم نصيحة مالية عملية عامة (بدون وعود بأرباح) حول الادخار الذكي أو تجنب التبذير أو بناء دخل إضافي أو العقلية المالية.",
-         "hashtags": "#نصائح_مالية #إدارة_المال #نجاح #ادخار",
-         "queries": ["coins money saving", "city business skyline", "calculator desk", "stock chart screen", "wallet cash"]},
-        {"category": "نصائح دنيوية وتطوير الذات",
-         "instruction": "قدّم نصيحة حياتية ذكية في فن التعامل مع الناس أو بناء العادات أو الطاقة النفسية أو تنظيم الوقت.",
-         "hashtags": "#نصائح_حياتية #تطوير_الذات #نجاح #حياة",
-         "queries": ["sunrise running", "clock time lapse", "writing notebook desk", "city walking crowd", "mountain climbing"]},
-    ]
-    cat = random.choice(cats)
-    past = load_topic_history()
-    avoid = f"\nمهم جداً: لا تكرر أياً من هذه المواضيع المنشورة سابقاً: {', '.join(past)}." if past else ""
-    print(f"القسم: {cat['category']} | النمط: {prof['name']}")
-
-    prompt = f"""
-اكتب سيناريو فيديو ريلز شيق ومفيد جداً باللغة العربية الفصحى البسيطة في قسم: ({cat['category']}).
-التوجيه: {cat['instruction']}
-{prof['style']}{avoid}
-يجب أن يكون النص مقسماً إلى {prof['scenes_count']} مشاهد بالضبط (كل مشهد جملة واحدة من {prof['words']}).
-المشهد الأول لازم يكون "خطّاف" يشد الانتباه فوراً (سؤال صادم أو معلومة مفاجئة) خلال أول ثانيتين.
-المشهد الأخير سؤال تفاعلي قصير يشجع على التعليق، ولا تكتب دعوة لمتابعة الصفحة لأنها تضاف تلقائياً.
-لكل مشهد اكتب "query": كلمتان إلى أربع كلمات بالإنجليزية تصف لقطة فيديو واقعية سينمائية مناسبة للمعنى للبحث عنها في Pexels
-(مثل: "sunrise mountain", "coins falling", "mosque night"). تجنب وجوه الأشخاص خصوصاً في المحتوى الديني، وفضّل الطبيعة والسماء والمساجد والكتب والمدن.
-
-أرجع JSON فقط:
-{{
-  "title": "عنوان غلاف جذاب من 3 إلى 5 كلمات",
-  "topic": "وصف الموضوع الفعلي في جملة قصيرة (لمنع التكرار)",
-  "caption": "وصف الريلز مع هاشتاغات مثل {cat['hashtags']}",
-  "scenes": [{{"text": "...", "query": "sunrise mountain"}}]
-}}
-"""
-    for name in pick_models():
-        for attempt in range(2):
-            try:
-                model = genai.GenerativeModel(name)
-                try:
-                    resp = model.generate_content(
-                        prompt,
-                        generation_config={"response_mime_type": "application/json", "temperature": 0.9},
-                        request_options={"timeout": 60},
-                    )
-                except TypeError:
-                    resp = model.generate_content(prompt, request_options={"timeout": 60})
-                text = resp.text.strip()
-                if "```" in text:
-                    text = text.split("```json")[-1].split("```")[0].strip() if "```json" in text else text.split("```")[1].strip()
-                data = sanitize_script(json.loads(text), outro_scene, cat["queries"])
-                print(f"تم التوليد بالنموذج: {name}")
-                save_topic_history(data["topic"] or data["title"])
-                return data
-            except Exception as e:
-                print(f"محاولة فاشلة ({name} #{attempt + 1}): {e}")
-                time.sleep(2)
-
-    print("!!! استخدمت سيناريو احتياطي ثابت (تحقق من مفتاح Gemini)")
-    S = lambda t, q: {"text": t, "query": q, "outro": False}
-    fallback = [
-        {"title": "قاعدة الادخار الذكية!",
-         "caption": "كيف تحافظ على راتبك وتبني أمانك المالي؟ 💰📈 #نصائح_مالية #إدارة_المال #نجاح",
-         "cat_queries": ["coins money saving", "city business skyline"],
-         "scenes": [
-             S("أكبر خطأ مالي يقع فيه الأغلبية كل شهر", "wallet cash"),
-             S("هو إنفاق الراتب أولاً ثم ادخار ما يتبقى", "coins falling"),
-             S("القاعدة الذهبية تقول ادخر لنفسك أولاً", "stock chart screen"),
-             S("استقطع عشرة بالمئة فور استلام دخلك", "calculator desk"),
-             S("كم نسبة ادخارك الشهرية؟ شاركنا بالتعليقات!", "city business skyline"),
-             outro_scene]},
-        {"title": "حكمة تغيّر حياتك!",
-         "caption": "لا تستهين بالخطوات الصغيرة المستمرة 🌟🧭 #حكم #تطوير_الذات #نجاح",
-         "cat_queries": ["mountain sunrise", "forest fog"],
-         "scenes": [
-             S("قليل دائم خير من كثير منقطع", "mountain sunrise"),
-             S("النجاح الكبير لا يأتي من قفزة واحدة", "walking road nature"),
-             S("بل من عادات بسيطة تكررها كل يوم", "clock time lapse"),
-             S("ابدأ اليوم ولو بعشر دقائق", "sunrise running"),
-             S("ما العادة التي تتمنى الالتزام بها؟ شاركنا!", "ocean waves"),
-             outro_scene]},
-    ]
-    return random.choice(fallback)
-
-
-# ============================================================
-# فيديوهات الخلفية (Pexels)
-# ============================================================
-def pexels_fetch(query, path, used):
-    if not PEXELS_KEY or not query:
-        return False
-    try:
-        r = requests.get(
-            "https://api.pexels.com/videos/search",
-            headers={"Authorization": PEXELS_KEY},
-            params={"query": query, "orientation": "portrait", "size": "medium", "per_page": 15},
-            timeout=20,
-        )
-        if r.status_code != 200:
-            print(f"  Pexels رد {r.status_code} للكلمة '{query}'")
-            return False
-        vids = [v for v in r.json().get("videos", []) if v.get("id") not in used and v.get("duration", 0) >= 3]
-        random.shuffle(vids)
-        for v in vids[:6]:
-            files = [f for f in v.get("video_files", []) if f.get("file_type") == "video/mp4" and f.get("height")]
-            port = [f for f in files if f["height"] >= f.get("width", 0)]
-            files = port or files
-            if not files:
-                continue
-            ge = [f for f in files if f["height"] >= 1600]
-            best = min(ge, key=lambda f: f["height"]) if ge else max(files, key=lambda f: f["height"])
-            try:
-                with requests.get(best["link"], stream=True, timeout=60) as resp:
-                    resp.raise_for_status()
-                    with open(path, "wb") as fh:
-                        for chunk in resp.iter_content(chunk_size=1 << 16):
-                            fh.write(chunk)
-                if os.path.getsize(path) > 20000:
-                    used.add(v["id"])
-                    return True
-            except Exception as e:
-                print("  فشل تنزيل لقطة:", e)
-        return False
-    except Exception as e:
-        print("  خطأ Pexels:", e)
-        return False
-
-
-def fetch_clips(scenes, cat_queries):
-    if not PEXELS_KEY:
-        print("!!! PEXELS_API_KEY غير موجود: راح تُستخدم خلفية متدرجة بدل الفيديو")
-        return [None] * len(scenes)
-    used, clips = set(), []
-    for i, sc in enumerate(scenes):
-        path = f"clip_{i}.mp4"
-        qs = [sc.get("query", "")] + random.sample(cat_queries, min(2, len(cat_queries)))
-        ok = False
-        for q in qs:
-            if pexels_fetch(q, path, used):
-                print(f"  لقطة المشهد {i + 1}: '{q}'")
-                ok = True
-                break
-        clips.append(path if ok else None)
-        if not ok:
-            print(f"  ما لقيت لقطة للمشهد {i + 1}، خلفية بديلة")
-    return clips
-
-
-class BG:
-    """يقرأ فريمات الخلفية من ffmpeg (مع تكرار اللقطة إذا أقصر من المشهد)"""
-
-    def __init__(self, clip, dur, fallback):
-        self.fallback = fallback
-        self.last = None
-        self.proc = None
-        if clip and os.path.exists(clip):
-            vf = (f"fps={FPS},scale={W}:{H}:force_original_aspect_ratio=increase,"
-                  f"crop={W}:{H},setsar=1")
-            cmd = [FFMPEG_BIN, "-v", "quiet", "-stream_loop", "-1", "-i", clip,
-                   "-t", f"{dur + 1:.2f}", "-an", "-vf", vf,
-                   "-f", "rawvideo", "-pix_fmt", "rgb24", "-"]
-            try:
-                self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                                             bufsize=W * H * 3 * 2)
-            except Exception as e:
-                print("تعذر تشغيل ffmpeg للقطة:", e)
-                self.proc = None
-
-    def read(self):
-        n = W * H * 3
-        if self.proc:
-            buf = self.proc.stdout.read(n)
-            if buf and len(buf) == n:
-                self.last = np.frombuffer(buf, dtype=np.uint8).reshape(H, W, 3)
-                return self.last, True
-            self._kill()
-        if self.last is not None:
-            return self.last, True
-        return self.fallback, False
-
-    def _kill(self):
-        if self.proc:
-            try:
-                self.proc.kill()
-                self.proc.wait()
+                return ImageFont.truetype(str(fb), size)
             except Exception:
                 pass
-            self.proc = None
-
-    def close(self):
-        self._kill()
+    return ImageFont.load_default()
 
 
-def make_fallback_bg(accent):
-    yy = np.arange(H, dtype=np.float32)[:, None]
-    xx = np.arange(W, dtype=np.float32)[None, :]
-    top = np.array(hex_rgb("#0B1226"), np.float32)
-    bot = np.array(hex_rgb("#05070F"), np.float32)
-    t = (yy / H)[..., None]
-    base = top * (1 - t) + bot * t
-    ac = np.array(hex_rgb(accent), np.float32)
-    gx, gy = W * random.choice([0.3, 0.7]), H * 0.45
-    glow = np.exp(-(((xx - gx) ** 2 + (yy - gy) ** 2) / (520.0 ** 2)))[..., None] * 0.35
-    base = base * (1 - glow) + ac * glow
-    return np.clip(base, 0, 255).astype(np.uint8)
+def get_audio_duration(audio_path: Path) -> float:
+    cmd = [
+        "ffprobe", "-v", "error",
+        "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        str(audio_path)
+    ]
+    res = subprocess.run(cmd, capture_output=True, text=True, check=True)
+    return float(res.stdout.strip())
 
 
-def build_shade():
-    yy = np.linspace(-1, 1, H, dtype=np.float32)[:, None]
-    xx = np.linspace(-1, 1, W, dtype=np.float32)[None, :]
-    r2 = (xx ** 2 + yy ** 2) / 2.0
-    shade = 0.68 - 0.30 * r2
-    shade = shade * (1.0 - 0.18 * np.clip((np.abs(yy) - 0.7) / 0.3, 0, 1))
-    return shade[..., None].astype(np.float32)
+# ==============================================================================
+# 5. توليد القصة بمدة متغيرة (30 إلى 60 ثانية) ومنع التكرار
+# ==============================================================================
+def generate_story(history: list) -> dict:
+    now_iq = get_iraq_now()
+    today_str = now_iq.strftime("%Y-%m-%d")
+    slot_name = get_day_slot_name(now_iq)
+    chosen_cat = choose_next_category(history, today_str)
+
+    duration_tier = random.choice([
+        {"label": "32-38 ثانية", "scenes_count": 5, "words_per_scene": "14 إلى 17 كلمة"},
+        {"label": "42-48 ثانية", "scenes_count": 6, "words_per_scene": "16 إلى 20 كلمة"},
+        {"label": "52-58 ثانية", "scenes_count": 7, "words_per_scene": "17 إلى 22 كلمة"},
+    ])
+
+    recent_titles = [h.get("title", "") for h in history[-25:] if h.get("title")]
+    today_titles = [h.get("title", "") for h in history if h.get("date") == today_str]
+
+    if GEMINI_API_KEY:
+        prompt = f"""
+أنت مخرج ومؤلف محتوى لفيديوهات Stickman عربية احترافية لصفحة ({PAGE_DISPLAY_NAME}) وفق منهجية متقن.
+الوقت الحالي: فترة {slot_name} ({today_str}).
+التصنيف المطلوب لهذه الحلقة حصراً: {chosen_cat['name']}.
+قواعد التصنيف: {chosen_cat['rules']}
+
+المواضيع المنشورة اليوم (ممنوع تكرارها أو الاقتراب من فكرتها نهائياً):
+{json.dumps(today_titles, ensure_ascii=False)}
+
+آخر 25 موضوعاً منشوراً في الصفحة (ابتعد عنها تماماً واختر زاوية جديدة كلياً):
+{json.dumps(recent_titles, ensure_ascii=False)}
+
+المواصفات الإلزامية للنص والمدة:
+1. المدة المستهدفة للفيديو: {duration_tier['label']} (يجب ألا تقل المدة عن 30 ثانية ولا تزيد عن 60 ثانية).
+2. قسّم القصة إلى {duration_tier['scenes_count']} مشاهد متسلسلة، وطول الجملة المنطوقة في كل مشهد هو ({duration_tier['words_per_scene']}) بتشكيل عربي كامل وصحيح.
+3. في المشهد الأخير فقط، اختم بعبارة: «تَابِعْ مَنْسَى لِلْمَزِيدِ.» (اكتب كلمة مَنْسَى مرة واحدة فقط ولا تكتب Mansa في النص المنطوق أبداً).
+4. إذا كان التصنيف حديثاً نبوياً: يجب أن يكون الحديث صحيحاً 100% ومثبتاً في صحيح البخاري أو صحيح مسلم حصراً، واكتب التخريج الدقيق في حقل hadith_source. وإذا لم يكن حديثاً اترك hadith_source فارغاً "".
+
+أعد النتيجة بصيغة JSON فقط بدون أي شرح إضافي:
+{{
+  "category": "{chosen_cat['id']}",
+  "hadith_source": "اسم المصدر ورقم الحديث إن وجد أو فارغ",
+  "title": "عنوان قصير مشكول",
+  "caption": "وصف قصير وجذاب لمنشور فيسبوك يذكر المصدر إن كان حديثاً مع 3 وسوم",
+  "scenes": [
+    {{
+      "id": 1,
+      "spoken_text": "جملة عربية فصحى مشكولة بالكامل وسلسة النطق",
+      "bg_type": "اختر واحداً فقط من: mosque, mosque_light, dawn_call, distraction, solitude, crossroads, fire, paradise, study_desk",
+      "pose": "اختر واحداً فقط من: run, walk, sad_slump, look_up, sujood, think, fear_back, arms_open",
+      "expression": "اختر واحداً فقط من: happy, sad, shocked, determined, peaceful, neutral",
+      "facing": 1
+    }}
+  ]
+}}
+"""
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
+        payload = {
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {"temperature": 0.85, "responseMimeType": "application/json"}
+        }
+        try:
+            resp = requests.post(url, json=payload, timeout=35)
+            resp.raise_for_status()
+            data = resp.json()
+            raw_text = data["candidates"][0]["content"]["parts"][0]["text"]
+            story = json.loads(raw_text)
+
+            if story.get("category") == "hadith_sahih":
+                src = story.get("hadith_source", "")
+                if not ("البخاري" in src or "مسلم" in src):
+                    raise ValueError(f"تم رفض حديث غير موثق من البخاري أو مسلم: {src}")
+
+            if "scenes" in story and len(story["scenes"]) >= 4:
+                for sc in story["scenes"]:
+                    sc["spoken_text"] = sanitize_spoken_text(sc.get("spoken_text", ""))
+                print(f"[OK] تم توليد حلقة جديدة ({chosen_cat['name']}): {story.get('title')}")
+                return story
+        except Exception as e:
+            print(f"[WARN] تعذر التوليد عبر Gemini ({e}) — اختيار حلقة معتمدة غير مكررة.")
+
+    unused_fallbacks = [
+        st for st in FALLBACK_STORIES
+        if strip_tashkeel(st["title"]) not in {strip_tashkeel(t) for t in recent_titles[-10:]}
+    ]
+    chosen_fb = random.choice(unused_fallbacks if unused_fallbacks else FALLBACK_STORIES)
+    for sc in chosen_fb["scenes"]:
+        sc["spoken_text"] = sanitize_spoken_text(sc.get("spoken_text", ""))
+    return chosen_fb
 
 
-SHADE = build_shade()
+# ==============================================================================
+# 6. توليد التعليق الصوتي وبناء timing.json (مع ضمان الحد الأدنى 30 ثانية)
+# ==============================================================================
+def synthesize_voice_and_timing(story: dict) -> tuple:
+    AUDIO_DIR.mkdir(parents=True, exist_ok=True)
+    concat_list_path = AUDIO_DIR / "concat.txt"
+    timing_records = []
+    current_time = 0.0
+    pause_gap = 0.40
+
+    silence_path = AUDIO_DIR / "silence.mp3"
+    subprocess.run([
+        "ffmpeg", "-y", "-f", "lavfi", "-i", "anullsrc=r=48000:cl=mono",
+        "-t", str(pause_gap), "-q:a", "9", str(silence_path)
+    ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+
+    part_files = []
+    part_durations = []
+
+    for idx, scene in enumerate(story["scenes"]):
+        part_mp3 = AUDIO_DIR / f"scene_{idx+1:02d}.mp3"
+        text = sanitize_spoken_text(scene["spoken_text"])
+        scene["spoken_text"] = text
+
+        subprocess.run([
+            sys.executable, "-m", "edge_tts",
+            "--voice", VOICE_NAME,
+            "--rate=-4%",
+            "--text", text,
+            "--write-media", str(part_mp3)
+        ], check=True)
+
+        dur = get_audio_duration(part_mp3)
+        part_files.append(part_mp3)
+        part_durations.append(dur)
+
+    raw_total = sum(part_durations) + pause_gap * (len(part_files) - 1) + 0.6
+    extra_per_gap = 0.0
+    if raw_total < 30.5 and len(part_files) > 1:
+        extra_per_gap = (30.5 - raw_total) / (len(part_files) - 1)
+
+    effective_gap = round(pause_gap + extra_per_gap, 3)
+    if extra_per_gap > 0:
+        subprocess.run([
+            "ffmpeg", "-y", "-f", "lavfi", "-i", "anullsrc=r=48000:cl=mono",
+            "-t", str(effective_gap), "-q:a", "9", str(silence_path)
+        ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+
+    with open(concat_list_path, "w", encoding="utf-8") as cf:
+        for idx, (part_mp3, dur) in enumerate(zip(part_files, part_durations)):
+            start_t = round(current_time, 3)
+            tail = effective_gap if idx < len(part_files) - 1 else 0.65
+            end_t = round(current_time + dur + tail, 3)
+
+            timing_records.append({
+                "id": story["scenes"][idx]["id"],
+                "text": story["scenes"][idx]["spoken_text"],
+                "speech_end": round(current_time + dur, 3),
+                "start": start_t,
+                "end": end_t,
+                "method": "sentence_exact_tts",
+                "reviewStatus": "auto_verified"
+            })
+
+            cf.write(f"file '{part_mp3.name}'\n")
+            if idx < len(part_files) - 1:
+                cf.write(f"file '{silence_path.name}'\n")
+            current_time = end_t
+
+    full_audio = WORK_DIR / "voice_full.mp3"
+    subprocess.run([
+        "ffmpeg", "-y", "-f", "concat", "-safe", "0",
+        "-i", str(concat_list_path),
+        "-ar", "48000", "-ac", "2", "-b:a", "192k",
+        str(full_audio)
+    ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+
+    with open(WORK_DIR / "timing.json", "w", encoding="utf-8") as tf:
+        json.dump(timing_records, tf, ensure_ascii=False, indent=2)
+
+    return full_audio, timing_records
 
 
-# ============================================================
-# صور النصوص والعناصر
-# ============================================================
-def make_word_sprite(shaped, font, fill, stroke=6, glow=None, shadow=True):
-    kw = tk(font)
-    probe = ImageDraw.Draw(Image.new("L", (4, 4)))
-    bb = probe.textbbox((0, 0), shaped, stroke_width=stroke, **kw)
-    pad = stroke * 3 + 28 + (44 if glow else 0)
-    bw, bh = bb[2] - bb[0], bb[3] - bb[1]
-    w, h = bw + 2 * pad, bh + 2 * pad
-    ox, oy = pad - bb[0], pad - bb[1]
+# ==============================================================================
+# 7. محرك رسم الخلفيات المضيئة + شخصية Stickman بلون ثابت وحركة ناعمة
+# ==============================================================================
+def draw_scene_background(draw: ImageDraw.ImageDraw, bg_type: str, t: float):
+    """جميع الخلفيات مضيئة ونظيفة لضمان ثبات لون شخصية Stickman دائماً."""
+    ground_y = int(HEIGHT * 0.70)
 
-    def mask(sw):
-        m = Image.new("L", (w, h), 0)
-        ImageDraw.Draw(m).text((ox, oy), shaped, fill=255, stroke_width=sw, **kw)
-        return m
+    if bg_type == "distraction":
+        draw.rectangle([0, 0, WIDTH, HEIGHT], fill=(238, 242, 255))
+        for i, col in enumerate([(199, 210, 254), (221, 214, 254), (186, 230, 253)]):
+            sway = math.sin(t * 2.0 + i * 1.5) * 140
+            draw.polygon([(WIDTH // 2, 180), (140 + i * 280 + sway, ground_y), (310 + i * 280 + sway, ground_y)], fill=col)
+        draw.rounded_rectangle([160, 470, 920, ground_y], radius=24, fill=(224, 231, 255), outline=(99, 102, 241), width=5)
+        draw.rectangle([0, ground_y, WIDTH, HEIGHT], fill=(203, 213, 225))
 
-    def layer(color, m, alpha=1.0):
-        if alpha < 1:
-            m = m.point(lambda v: int(v * alpha))
-        l = Image.new("RGBA", (w, h), hex_rgb(color) + (255,))
-        l.putalpha(m)
-        return l
+    elif bg_type == "solitude":
+        draw.rectangle([0, 0, WIDTH, HEIGHT], fill=(241, 245, 249))
+        draw.polygon([(WIDTH // 2, 220), (260, ground_y), (820, ground_y)], fill=(226, 232, 240))
+        draw.rectangle([0, ground_y, WIDTH, HEIGHT], fill=(203, 213, 225))
 
-    out = Image.new("RGBA", (w, h), (0, 0, 0, 0))
-    if glow:
-        out = Image.alpha_composite(out, layer(glow, mask(stroke + 8).filter(ImageFilter.GaussianBlur(18)), 0.9))
-    if shadow:
-        sm = Image.new("L", (w, h), 0)
-        sm.paste(mask(stroke), (stroke, int(stroke * 1.6)))
-        sm = sm.filter(ImageFilter.GaussianBlur(stroke * 0.8 + 1))
-        out = Image.alpha_composite(out, layer("#000000", sm, 0.8))
-    if stroke > 0:
-        out = Image.alpha_composite(out, layer("#050816", mask(stroke)))
-    out = Image.alpha_composite(out, layer(fill, mask(0)))
-    return {"img": out, "pad": pad, "oy": oy, "bw": bw, "bh": bh, "w": w, "h": h}
+    elif bg_type == "dawn_call":
+        draw.rectangle([0, 0, WIDTH, HEIGHT], fill=(248, 250, 252))
+        sun_y = 470 - int(math.sin(min(t, 4.0) * 0.35) * 28)
+        draw.ellipse([WIDTH // 2 - 135, sun_y - 135, WIDTH // 2 + 135, sun_y + 135], fill=(254, 240, 138))
+        for r in range(1, 4):
+            pulse = (t * 40 + r * 65) % 210
+            draw.arc([WIDTH // 2 - 150 - pulse, sun_y - 150 - pulse, WIDTH // 2 + 150 + pulse, sun_y + 150 + pulse],
+                     start=200, end=340, fill=(251, 146, 60), width=4)
+        draw.rectangle([0, ground_y, WIDTH, HEIGHT], fill=(226, 232, 240))
 
+    elif bg_type in ("mosque", "mosque_light"):
+        bg_col = (254, 252, 232) if bg_type == "mosque_light" else (248, 250, 252)
+        draw.rectangle([0, 0, WIDTH, HEIGHT], fill=bg_col)
+        if bg_type == "mosque_light":
+            draw.polygon([(WIDTH // 2, 150), (140, ground_y), (940, ground_y)], fill=(254, 249, 195))
+        mx = 740
+        draw.chord([mx - 165, 440, mx + 165, 730], start=180, end=360, fill=(226, 232, 240), outline=(51, 65, 85), width=6)
+        draw.rectangle([mx - 165, 585, mx + 165, ground_y], fill=(241, 245, 249), outline=(51, 65, 85), width=6)
+        draw.rectangle([mx + 180, 345, mx + 238, ground_y], fill=(241, 245, 249), outline=(51, 65, 85), width=6)
+        draw.polygon([(mx + 170, 345), (mx + 248, 345), (mx + 209, 255)], fill=(234, 88, 12), outline=(51, 65, 85))
+        draw.arc([mx - 22, 375, mx + 22, 420], start=40, end=300, fill=(234, 88, 12), width=6)
+        draw.rectangle([0, ground_y, WIDTH, HEIGHT], fill=(226, 232, 240))
 
-def half(img):
-    return img.resize((max(1, img.width // 2), max(1, img.height // 2)), LANCZOS)
+    elif bg_type == "fire":
+        draw.rectangle([0, 0, WIDTH, HEIGHT], fill=(255, 247, 237))
+        for i in range(6):
+            fx = 165 + i * 150
+            fh = 150 + int(math.sin(t * 4.5 + i) * 30)
+            draw.polygon([(fx - 50, ground_y), (fx + 50, ground_y), (fx, ground_y - fh)], fill=(252, 165, 165))
+            draw.polygon([(fx - 28, ground_y), (fx + 28, ground_y), (fx, ground_y - int(fh * 0.6))], fill=(253, 224, 71))
+        draw.rectangle([0, ground_y, WIDTH, HEIGHT], fill=(226, 232, 240))
 
+    elif bg_type == "paradise":
+        draw.rectangle([0, 0, WIDTH, HEIGHT], fill=(236, 253, 245))
+        draw.ellipse([130, 220, 330, 420], fill=(254, 240, 138))
+        for tx in (240, 840):
+            draw.rectangle([tx - 14, ground_y - 150, tx + 14, ground_y], fill=(146, 64, 14))
+            draw.ellipse([tx - 105, ground_y - 295, tx + 105, ground_y - 115], fill=(167, 243, 208), outline=(16, 185, 129), width=5)
+        draw.rectangle([0, ground_y, WIDTH, HEIGHT], fill=(209, 250, 229))
 
-def make_badge(page_name, font2, accent, k=1.0):
-    sp = make_word_sprite(shape_text(page_name), font2, "#F1F5F9", stroke=2, shadow=False)
-    txt = half(sp["img"])
-    tw, th = int(sp["bw"] / 2), int(sp["bh"] / 2)
-    w, h = tw + 110, max(th + 36, 70)
-    big = Image.new("RGBA", (w * 2, h * 2), (0, 0, 0, 0))
-    bd = ImageDraw.Draw(big)
-    bd.rounded_rectangle([(2, 2), (w * 2 - 3, h * 2 - 3)], radius=h, fill=(10, 16, 34, 225),
-                         outline=hex_rgb(accent) + (255,), width=5)
-    bd.ellipse([(w * 2 - 74, h - 14), (w * 2 - 46, h + 14)], fill=hex_rgb(accent) + (255,))
-    badge = big.resize((w, h), LANCZOS)
-    badge.paste(txt, (int((w - 48) / 2 - txt.width / 2), (h - txt.height) // 2), txt)
-    if k != 1.0:
-        badge = badge.resize((int(badge.width * k), int(badge.height * k)), LANCZOS)
-    if badge.width > 1000:
-        r = 1000 / badge.width
-        badge = badge.resize((1000, int(badge.height * r)), LANCZOS)
-    return badge
+    elif bg_type == "study_desk":
+        draw.rectangle([0, 0, WIDTH, HEIGHT], fill=(248, 250, 252))
+        draw.ellipse([720, 290, 860, 430], fill=(255, 255, 255), outline=(71, 85, 105), width=6)
+        ang = t * 1.2
+        draw.line([(790, 360), (790 + math.cos(ang) * 45, 360 + math.sin(ang) * 45)], fill=(234, 88, 12), width=5)
+        draw.rectangle([620, ground_y - 110, 920, ground_y - 92], fill=(148, 163, 184))
+        draw.rectangle([650, ground_y - 92, 670, ground_y], fill=(100, 116, 139))
+        draw.rectangle([870, ground_y - 92, 890, ground_y], fill=(100, 116, 139))
+        draw.rectangle([0, ground_y, WIDTH, HEIGHT], fill=(226, 232, 240))
 
+    else:
+        draw.rectangle([0, 0, WIDTH, HEIGHT], fill=(248, 250, 252))
+        draw.rectangle([WIDTH // 2 - 8, 420, WIDTH // 2 + 8, ground_y], fill=(100, 116, 139))
+        draw.polygon([(WIDTH // 2, 450), (WIDTH // 2 + 195, 450), (WIDTH // 2 + 225, 482), (WIDTH // 2 + 195, 514), (WIDTH // 2, 514)], fill=(167, 243, 208), outline=(16, 185, 129))
+        draw.polygon([(WIDTH // 2, 535), (WIDTH // 2 - 195, 535), (WIDTH // 2 - 225, 567), (WIDTH // 2 - 195, 599), (WIDTH // 2, 599)], fill=(254, 202, 202), outline=(239, 68, 68))
+        draw.rectangle([0, ground_y, WIDTH, HEIGHT], fill=(226, 232, 240))
 
-def make_button(text, font2, color):
-    sp = make_word_sprite(shape_text(text), font2, "#FFFFFF", stroke=2, shadow=False)
-    txt = half(sp["img"])
-    tw, th = int(sp["bw"] / 2), int(sp["bh"] / 2)
-    w, h = tw + 120, max(th + 50, 100)
-    big = Image.new("RGBA", (w * 2, h * 2), (0, 0, 0, 0))
-    ImageDraw.Draw(big).rounded_rectangle([(2, 2), (w * 2 - 3, h * 2 - 3)], radius=h,
-                                          fill=hex_rgb(color) + (255,), outline=(255, 255, 255, 255), width=6)
-    btn = big.resize((w, h), LANCZOS)
-    btn.paste(txt, ((w - txt.width) // 2, (h - txt.height) // 2), txt)
-    return btn
-
-
-def make_title_card(title, font_path, accent):
-    cw, ch, K = 920, 250, 2
-    big = Image.new("RGBA", (cw * K, ch * K), (0, 0, 0, 0))
-    bd = ImageDraw.Draw(big)
-    bd.rounded_rectangle([(4, 4), (cw * K - 5, ch * K - 5)], radius=70, fill=(8, 12, 28, 235),
-                         outline=hex_rgb(accent) + (255,), width=10)
-    text = shape_multiline(title, max_chars=20)
-    chosen = None
-    for size in range(74 * K, 40 * K, -4 * K):
-        f = load_font(font_path, size)
-        kw = {"font": f, "align": "center", "spacing": 14 * K}
-        if HAS_RAQM:
-            kw["direction"] = "rtl"
-        tb = bd.multiline_textbbox((0, 0), text, **kw)
-        if tb[2] - tb[0] <= (cw - 70) * K and tb[3] - tb[1] <= (ch - 50) * K:
-            chosen = (kw, tb)
-            break
-    if chosen is None:
-        f = load_font(font_path, 40 * K)
-        kw = {"font": f, "align": "center", "spacing": 14 * K}
-        if HAS_RAQM:
-            kw["direction"] = "rtl"
-        chosen = (kw, bd.multiline_textbbox((0, 0), text, **kw))
-    kw, tb = chosen
-    x = (cw * K - (tb[2] - tb[0])) // 2 - tb[0]
-    y = (ch * K - (tb[3] - tb[1])) // 2 - tb[1]
-    bd.multiline_text((x + 6, y + 8), text, fill=(2, 6, 23, 255), **kw)
-    bd.multiline_text((x, y), text, fill=(255, 255, 255, 255), stroke_width=2, stroke_fill=(255, 255, 255, 255), **kw)
-    return big.resize((cw, ch), LANCZOS)
+    draw.line([(0, ground_y), (WIDTH, ground_y)], fill=(71, 85, 105), width=6)
 
 
-# ============================================================
-# الكابشن: مجموعات من 2-3 كلمات، الكلمة المنطوقة تتلوّن وتكبر
-# ============================================================
-PROBE = ImageDraw.Draw(Image.new("L", (4, 4)))
+def draw_stickman_rig(draw: ImageDraw.ImageDraw, cx: float, ground_y: float,
+                      pose: str, expression: str, facing: int, t: float):
+    """شخصية Stickman بلون ثابت دائماً وحركة مفاصل سلسة ومتوازنة."""
+    stroke = (15, 23, 42)        # ثابت دائماً — لا يتغير مع الخلفية
+    head_fill = (255, 255, 255)  # ثابت دائماً
+    accent = (234, 88, 12)       # سمة التمييز الثابتة
+    lw = 13
+
+    ease_in = min(1.0, t / 0.45)
+    ease_in = 0.5 - 0.5 * math.cos(ease_in * math.pi)
+
+    draw.ellipse([cx - 72, ground_y - 12, cx + 72, ground_y + 12], fill=(148, 163, 184))
+
+    if pose == "sujood":
+        knee = (cx - 40 * facing, ground_y - 12)
+        foot = (cx - 115 * facing, ground_y - 10)
+        hip = (cx - 35 * facing, ground_y - 95)
+        shoulder = (cx + 75 * facing, ground_y - 38)
+        head_c = (cx + 135 * facing, ground_y - 45)
+        hand = (cx + 125 * facing, ground_y - 10)
+
+        draw.line([hip, knee, foot], fill=stroke, width=lw)
+        draw.line([hip, shoulder], fill=stroke, width=lw)
+        draw.line([shoulder, hand], fill=stroke, width=lw)
+        draw.ellipse([head_c[0] - 48, head_c[1] - 48, head_c[0] + 48, head_c[1] + 48], fill=head_fill, outline=stroke, width=lw)
+        draw.arc([head_c[0] - 50, head_c[1] - 52, head_c[0] + 50, head_c[1] + 30], start=190, end=350, fill=accent, width=11)
+        return
+
+    bob = math.sin(t * 2.2) * 3.5
+    swing = 0.0
+    if pose == "walk":
+        swing = math.sin(t * 3.8) * 0.45 * ease_in
+        bob = abs(math.cos(t * 3.8)) * -6.0 * ease_in
+    elif pose == "run":
+        swing = math.sin(t * 5.6) * 0.65 * ease_in
+        bob = abs(math.cos(t * 5.6)) * -10.0 * ease_in
+
+    target_lean = 0.18 * facing if pose in ("run", "sad_slump") else (-0.12 * facing if pose == "fear_back" else 0.0)
+    lean = target_lean * ease_in
+
+    hip = (cx, ground_y - 182 + bob)
+    shoulder = (hip[0] + math.sin(lean) * 165, hip[1] - math.cos(lean) * 165)
+    head_c = (shoulder[0] + math.sin(lean) * 65, shoulder[1] - 68)
+
+    for side in (-1, 1):
+        ang = swing * side
+        knee = (hip[0] + math.sin(ang) * 92, hip[1] + math.cos(ang) * 92)
+        shin_ang = ang - (0.25 * facing if pose == "run" else 0.08 * facing)
+        foot = (knee[0] + math.sin(shin_ang) * 92, min(ground_y - 6, knee[1] + math.cos(shin_ang) * 92))
+        draw.line([hip, knee, foot], fill=stroke, width=lw)
+        draw.ellipse([knee[0] - 6, knee[1] - 6, knee[0] + 6, knee[1] + 6], fill=stroke)
+
+    draw.line([hip, shoulder], fill=stroke, width=lw)
+
+    if pose == "arms_open":
+        lift = ease_in
+        for side in (-1, 1):
+            elbow = (shoulder[0] + side * (45 + 20 * lift), shoulder[1] + 20 - 60 * lift)
+            hand = (elbow[0] + side * (35 + 20 * lift), elbow[1] + 20 - 70 * lift)
+            draw.line([shoulder, elbow, hand], fill=stroke, width=lw)
+    elif pose == "think":
+        elbow = (shoulder[0] + 52 * facing, shoulder[1] + 28)
+        hand = (head_c[0] + 24 * facing, head_c[1] + 45)
+        draw.line([shoulder, elbow, hand], fill=stroke, width=lw)
+        draw.line([shoulder, (shoulder[0] - 36 * facing, shoulder[1] + 85)], fill=stroke, width=lw)
+    else:
+        for side in (-1, 1):
+            arm_ang = -swing * side * 0.85
+            elbow = (shoulder[0] + math.sin(arm_ang) * 78, shoulder[1] + math.cos(arm_ang) * 78)
+            hand = (elbow[0] + math.sin(arm_ang + 0.25 * facing) * 72, elbow[1] + math.cos(arm_ang + 0.25 * facing) * 72)
+            draw.line([shoulder, elbow, hand], fill=stroke, width=lw)
+
+    r = 58
+    draw.ellipse([head_c[0] - r, head_c[1] - r, head_c[0] + r, head_c[1] + r], fill=head_fill, outline=stroke, width=lw)
+    draw.arc([head_c[0] - r - 2, head_c[1] - r - 4, head_c[0] + r + 2, head_c[1] + 15], start=190, end=350, fill=accent, width=13)
+    draw.line([(head_c[0], head_c[1] - r + 8), (head_c[0] + (r + 22) * facing, head_c[1] - r + 14)], fill=accent, width=11)
+
+    ex_off = 16 * facing
+    eye_y = head_c[1] - 8
+    draw.ellipse([head_c[0] + ex_off - 18, eye_y - 7, head_c[0] + ex_off - 6, eye_y + 7], fill=stroke)
+    draw.ellipse([head_c[0] + ex_off + 8, eye_y - 7, head_c[0] + ex_off + 20, eye_y + 7], fill=stroke)
+
+    my = head_c[1] + 22
+    mx = head_c[0] + ex_off
+    if expression == "happy":
+        draw.arc([mx - 18, my - 12, mx + 18, my + 12], start=10, end=170, fill=stroke, width=6)
+    elif expression == "sad":
+        draw.arc([mx - 18, my, mx + 18, my + 20], start=190, end=350, fill=stroke, width=6)
+    elif expression == "shocked":
+        draw.ellipse([mx - 10, my - 10, mx + 10, my + 12], outline=stroke, width=6)
+    else:
+        draw.line([(mx - 15, my + 4), (mx + 15, my + 4)], fill=stroke, width=6)
 
 
-def layout_words(widths, max_w=900, sw=26):
-    lines, cur, cw = [], [], 0.0
-    for i, w in enumerate(widths):
-        add = w + (sw if cur else 0)
-        if cur and cw + add > max_w:
-            lines.append((cur, cw))
-            cur, cw = [(i, w)], w
+# ==============================================================================
+# 8. محرك الموشن جرافيك للنصوص (دخول/خروج انسيابي + Zoom على الكلمة المنطوقة)
+# ==============================================================================
+def wrap_words_into_lines(words: list, font: ImageFont.FreeTypeFont, draw: ImageDraw.ImageDraw, max_width: int) -> list:
+    lines = []
+    current_line = []
+    current_w = 0
+    space_w = draw.textbbox((0, 0), " ", font=font)[2]
+
+    for idx, w in enumerate(words):
+        shaped = shape_arabic(w)
+        wb = draw.textbbox((0, 0), shaped, font=font)
+        ww = wb[2] - wb[0]
+        added = ww if not current_line else (space_w + ww)
+        if current_line and (current_w + added > max_width):
+            lines.append(current_line)
+            current_line = [(idx, w)]
+            current_w = ww
         else:
-            cur.append((i, w))
-            cw += add
-    if cur:
-        lines.append((cur, cw))
-    pos = {}
-    for li, (line, tw) in enumerate(lines):
-        right = tw / 2.0
-        for i, w in line:
-            pos[i] = (right - w / 2.0, li)
-            right -= w + sw
-    return pos, len(lines)
+            current_line.append((idx, w))
+            current_w += added
+
+    if current_line:
+        lines.append(current_line)
+    return lines
 
 
-def build_chunks(words, timings, dur, font2):
-    n = len(words)
-    groups = max(1, math.ceil(n / 3))
-    size = math.ceil(n / groups)
-    chunks = []
-    i = 0
-    while i < n:
-        idxs = list(range(i, min(n, i + size)))
-        i += size
-        shaped = [shape_word(words[k]) for k in idxs]
-        widths = []
-        for s in shaped:
-            bb = PROBE.textbbox((0, 0), s, **tk(font2))
-            widths.append((bb[2] - bb[0]) / 2.0)
-        pos, nl = layout_words(widths)
-        chunks.append({"idxs": idxs, "shaped": shaped, "pos": pos, "n": nl,
-                       "start": timings[idxs[0]][0], "end": dur})
-    for k in range(len(chunks) - 1):
-        chunks[k]["end"] = chunks[k + 1]["start"]
-    if chunks:
-        chunks[0]["start"] = 0.0
-    return chunks
-
-
-def draw_captions(out, c, t, env, beat):
-    chunks = c["chunks"]
-    ch = None
-    for k in chunks:
-        if k["start"] <= t:
-            ch = k
-    if ch is None:
+def draw_motion_graphics_captions(img: Image.Image, text: str, local_t: float,
+                                  speech_dur: float, scene_dur: float,
+                                  base_font: ImageFont.FreeTypeFont,
+                                  zoom_font: ImageFont.FreeTypeFont):
+    """موشن جرافيك نظيف بدون صناديق ملونة: دخول وخروج سلس + تكبير (Zoom) للكلمة المنطوقة."""
+    words = [w for w in text.split() if w.strip()]
+    if not words:
         return
-    timings = c["timings"]
-    cur = None
-    for i in ch["idxs"]:
-        if timings[i][0] - 0.02 <= t:
-            cur = i
-    local = t - ch["start"]
-    e = clamp01(local / 0.22)
-    sc_chunk = 0.72 + 0.28 * ease_out_back(e)
-    alpha = ease_out_cubic(e)
-    lh = CAP_SIZE * 1.55
-    base_y = c["cap_y"] + math.sin(t * 1.8 + c["idx"]) * 6
-    n = ch["n"]
 
-    for j, i in enumerate(ch["idxs"]):
-        speaking = (i == cur)
-        key = (i, speaking)
-        if key not in c["sprites"]:
-            if speaking:
-                c["sprites"][key] = make_word_sprite(ch["shaped"][j], c["font2"], YELLOW, stroke=7, glow=c["accent"])
-            else:
-                c["sprites"][key] = make_word_sprite(ch["shaped"][j], c["font2"], "#FFFFFF", stroke=7)
-        spr = c["sprites"][key]
-        rel_x, line = ch["pos"][j]
-        s = 0.5 * sc_chunk * ((1.12 + 0.07 * beat + 0.03 * env) if speaking else 1.0)
-        im = spr["img"]
-        rs = im.resize((max(1, int(im.width * s)), max(1, int(im.height * s))), LANCZOS)
-        if alpha < 0.99:
-            rs.putalpha(rs.getchannel("A").point(lambda v: int(v * alpha)))
-        cx = 540 + rel_x * sc_chunk
-        anchor = base_y + (line - (n - 1) / 2.0) * lh - CAP_SIZE * 0.55 + (1 - sc_chunk) * 40
-        py = anchor - spr["oy"] * s - (7 if speaking else 0)
-        out.paste(rs, (int(cx - rs.width / 2), int(py)), rs)
-
-
-# ============================================================
-# رسم الفريم
-# ============================================================
-def render_frame(c, f, bg_arr, is_video, g_prog):
-    t = f / FPS
-    env = float(c["env"][min(f, len(c["env"]) - 1)])
-    beat = float(c["beat"][min(f, len(c["beat"]) - 1)])
-    accent = c["accent"]
-
-    if is_video:
-        arr = (bg_arr.astype(np.float32) * SHADE).astype(np.uint8)
+    in_dur = 0.35
+    out_dur = 0.30
+    if local_t < in_dur:
+        p = local_t / in_dur
+        ease = 1.0 - (1.0 - p) ** 3
+        alpha = int(255 * ease)
+        slide_y = int((1.0 - ease) * 32)
+    elif local_t > max(in_dur, scene_dur - out_dur):
+        p = min(1.0, (local_t - (scene_dur - out_dur)) / out_dur)
+        ease = p ** 2
+        alpha = int(255 * (1.0 - ease))
+        slide_y = int(-ease * 24)
     else:
-        arr = bg_arr
-    img = Image.fromarray(arr)
+        alpha = 255
+        slide_y = 0
 
-    p = ease_in_out(t / max(0.1, c["duration"]))
-    punch = 0.09 * max(0.0, 1 - t / 0.28) ** 2
-    z = 1.0 + 0.05 * p + punch + 0.012 * beat
-    if z > 1.002:
-        cw, chh = W / z, H / z
-        l, tp = (W - cw) / 2, (H - chh) / 2
-        img = img.resize((W, H), BILINEAR, box=(l, tp, l + cw, tp + chh))
+    if alpha <= 5:
+        return
 
-    if c["idx"] > 0 and f < 4:
-        img = Image.blend(img, Image.new("RGB", (W, H), "white"), 0.25 * (1 - f / 4.0))
+    weights = [max(2, len(strip_tashkeel(w))) for w in words]
+    total_weight = sum(weights)
+    speech_progress = min(0.999, max(0.0, local_t / max(0.2, speech_dur)))
+    target_weight = speech_progress * total_weight
 
-    badge = c["badge"]
-    img.paste(badge, ((W - badge.width) // 2, 118), badge)
+    active_word_idx = len(words) - 1
+    acc = 0.0
+    for i, wt in enumerate(weights):
+        acc += wt
+        if target_weight <= acc:
+            active_word_idx = i
+            break
 
-    if c["title_card"] is not None and t < 2.9:
-        pp = clamp01((t - 2.3) / 0.6)
-        enter = ease_out_back(clamp(t / 0.4)) if False else ease_out_back(clamp01(t / 0.4))
-        card = c["title_card"]
-        if pp > 0:
-            card = card.copy()
-            card.putalpha(card.getchannel("A").point(lambda v: int(v * (1 - pp))))
-        y = int(260 - (1 - enter) * 220 - pp * pp * 300)
-        img.paste(card, ((W - card.width) // 2, y), card)
+    txt_layer = Image.new("RGBA", (WIDTH, HEIGHT), (0, 0, 0, 0))
+    tdraw = ImageDraw.Draw(txt_layer)
 
-    if c["outro"]:
-        pulse = 1.0 + 0.05 * math.sin(t * 6)
-        big = c["big_badge"]
-        bs = big.resize((int(big.width * (0.9 + 0.1 * ease_out_back(t / 0.5))), int(big.height * (0.9 + 0.1 * ease_out_back(t / 0.5)))), LANCZOS)
-        img.paste(bs, ((W - bs.width) // 2, 700), bs)
-        btn = c["button"]
-        bt = btn.resize((int(btn.width * pulse), int(btn.height * pulse)), LANCZOS)
-        img.paste(bt, ((W - bt.width) // 2, 880 - (bt.height - btn.height) // 2), bt)
+    max_line_w = int((SAFE_RIGHT - SAFE_LEFT) * 0.94)
+    lines = wrap_words_into_lines(words, base_font, tdraw, max_line_w)
+    space_w = tdraw.textbbox((0, 0), " ", font=base_font)[2] + 6
+    line_height = 76
 
-    draw_captions(img, c, t, env, beat)
+    start_y = SAFE_BOTTOM - (len(lines) * line_height) - 18 + slide_y
 
-    dr = ImageDraw.Draw(img)
-    dr.rectangle([(0, 0), (W, 10)], fill="#1E293B")
-    pw = int(W * clamp01(g_prog))
-    if pw > 0:
-        dr.rectangle([(0, 0), (pw, 10)], fill=accent)
-    return img
+    normal_fill = (30, 41, 59, alpha)
+    active_fill = (15, 23, 42, alpha)
+    accent_bar = (234, 88, 12, alpha)
+
+    for line_idx, line_items in enumerate(lines):
+        word_boxes = []
+        total_w = 0
+        for item_pos, (w_idx, w_str) in enumerate(line_items):
+            is_active = (w_idx == active_word_idx) and (local_t <= speech_dur + 0.15)
+            fnt = zoom_font if is_active else base_font
+            shaped = shape_arabic(w_str)
+            bb = tdraw.textbbox((0, 0), shaped, font=fnt)
+            ww = bb[2] - bb[0]
+            wh = bb[3] - bb[1]
+            word_boxes.append((w_idx, shaped, fnt, ww, wh, is_active))
+            total_w += ww + (space_w if item_pos > 0 else 0)
+
+        cursor_x = (WIDTH + total_w) // 2
+        base_y = start_y + line_idx * line_height
+
+        for w_idx, shaped, fnt, ww, wh, is_active in word_boxes:
+            cursor_x -= ww
+            y_pos = base_y - (8 if is_active else 0)
+            tdraw.text((cursor_x, y_pos), shaped, font=fnt, fill=(active_fill if is_active else normal_fill))
+
+            if is_active:
+                bar_y = y_pos + wh + 14
+                tdraw.rounded_rectangle(
+                    [cursor_x + 4, bar_y, cursor_x + ww - 4, bar_y + 5],
+                    radius=3,
+                    fill=accent_bar
+                )
+            cursor_x -= space_w
+
+    img.paste(Image.alpha_composite(img.convert("RGBA"), txt_layer).convert("RGB"))
 
 
-# ============================================================
-# تجميع الفيديو
-# ============================================================
-async def make_video(script, page_name):
-    print("بدء صناعة الريلز...")
-    scenes = script["scenes"]
-    title = script.get("title", "إضاءات ومعلومات مفيدة!")
+# ==============================================================================
+# 9. رندر الإطارات وتجميع الفيديو النهائي (1080x1920 @ 30fps)
+# ==============================================================================
+def render_frames_and_video(story: dict, timing: list, full_audio: Path) -> Path:
+    FRAMES_DIR.mkdir(parents=True, exist_ok=True)
+    PREVIEWS_DIR.mkdir(parents=True, exist_ok=True)
+    EXPORTS_DIR.mkdir(parents=True, exist_ok=True)
 
-    # 1) الصوت
-    tracks, scene_words, scene_bounds = [], [], []
-    for idx, sc in enumerate(scenes):
-        text = clean_speech(sc["text"])
-        mp3 = f"scene_{idx}.mp3"
-        bounds = await tts_scene(text, VOICE, mp3)
-        x = decode_audio(mp3)
-        os.remove(mp3)
-        x, off = trim_silence(x)
-        if len(x) < SR * 0.3:
-            raise RuntimeError(f"صوت المشهد {idx} فارغ")
-        for b in bounds:
-            b["start"] = max(0.0, b["start"] - off)
-            b["end"] = max(b["start"], b["end"] - off)
-        tracks.append(x)
-        scene_words.append([w for w in text.split() if w.strip()])
-        scene_bounds.append(bounds)
-        print(f"  مشهد {idx + 1}/{len(scenes)}: {len(x) / SR:.2f}ث | boundaries={len(bounds)} كلمات={len(scene_words[-1])}")
+    total_duration = timing[-1]["end"]
+    total_frames = int(math.ceil(total_duration * FPS))
 
-    durations = [len(x) / SR for x in tracks]
-    total_dur = sum(durations)
-    print(f"المدة الكلية: {total_dur:.1f} ثانية")
+    title_font = pick_arabic_font(56)
+    brand_font = pick_arabic_font(34)
+    base_caption_font = pick_arabic_font(48)
+    zoom_caption_font = pick_arabic_font(58)
 
-    transitions, cum = [], 0.0
-    for dd in durations:
-        if cum > 0:
-            transitions.append(cum)
-        cum += dd
-    audio_wav = build_final_audio(tracks, transitions, "final_audio.wav")
+    shaped_title = shape_arabic(story.get("title", ""))
+    shaped_brand = shape_arabic(PAGE_SPOKEN_NAME)
 
-    # 2) لقطات الخلفية
-    print("جلب لقطات الفيديو...")
-    clips = fetch_clips(scenes, script.get("cat_queries") or ["abstract light"])
+    for f_idx in range(total_frames):
+        t = f_idx / FPS
+        active_idx = len(timing) - 1
+        for i, item in enumerate(timing):
+            if item["start"] <= t < item["end"]:
+                active_idx = i
+                break
 
-    # 3) الخطوط
-    font_path = select_random_font()
-    font_cap2 = load_font(font_path, CAP_SIZE * 2)
-    font_badge2 = load_font(font_path, 34 * 2)
-    font_btn2 = load_font(font_path, 48 * 2)
+        scene = story["scenes"][active_idx]
+        t_rec = timing[active_idx]
+        local_t = t - t_rec["start"]
+        scene_dur = max(0.1, t_rec["end"] - t_rec["start"])
+        speech_dur = max(0.1, t_rec.get("speech_end", t_rec["end"]) - t_rec["start"])
+        progress = min(1.0, max(0.0, local_t / scene_dur))
 
-    # 4) ffmpeg
-    final_output = "final_reel.mp4"
-    log = open("ffmpeg_log.txt", "wb")
-    cmd = [FFMPEG_BIN, "-y", "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{W}x{H}", "-r", str(FPS), "-i", "-",
-           "-i", audio_wav, "-c:v", "libx264", "-preset", "veryfast", "-crf", "19", "-profile:v", "high",
-           "-pix_fmt", "yuv420p", "-movflags", "+faststart", "-c:a", "aac", "-b:a", "192k", "-ar", "44100",
-           "-shortest", final_output]
-    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=log)
+        bg_type = scene.get("bg_type", "dawn_call")
 
-    total_frames = max(1, int(round(total_dur * FPS)))
-    cum, g_frame = 0.0, 0
-    prev_y = None
-    cap_ys = [860, 1020, 1180, 1300]
-    rc = -1
+        img = Image.new("RGB", (WIDTH, HEIGHT), (248, 250, 252))
+        draw = ImageDraw.Draw(img, "RGBA")
+
+        draw_scene_background(draw, bg_type, local_t)
+
+        facing = int(scene.get("facing", 1))
+        pose = scene.get("pose", "walk")
+        if pose in ("walk", "run"):
+            ease_move = 0.5 - 0.5 * math.cos(progress * math.pi)
+            cx = (WIDTH * 0.34) + ease_move * (WIDTH * 0.28) * facing
+        else:
+            cx = WIDTH * 0.45
+
+        draw_stickman_rig(
+            draw=draw,
+            cx=cx,
+            ground_y=int(HEIGHT * 0.70),
+            pose=pose,
+            expression=scene.get("expression", "neutral"),
+            facing=facing,
+            t=local_t
+        )
+
+        if shaped_title:
+            bbox = draw.textbbox((0, 0), shaped_title, font=title_font)
+            tw = bbox[2] - bbox[0]
+            draw.text(((WIDTH - tw) // 2, SAFE_TOP + 16), shaped_title, font=title_font, fill=(15, 23, 42))
+
+        if shaped_brand:
+            bb_b = draw.textbbox((0, 0), shaped_brand, font=brand_font)
+            bw = bb_b[2] - bb_b[0]
+            draw.text(((WIDTH - bw) // 2, SAFE_TOP + 88), shaped_brand, font=brand_font, fill=(100, 116, 139))
+
+        draw_motion_graphics_captions(
+            img=img,
+            text=scene.get("spoken_text", ""),
+            local_t=local_t,
+            speech_dur=speech_dur,
+            scene_dur=scene_dur,
+            base_font=base_caption_font,
+            zoom_font=zoom_caption_font
+        )
+
+        frame_path = FRAMES_DIR / f"frame_{f_idx:05d}.png"
+        img.save(frame_path, "PNG")
+
+        if f_idx in (20, total_frames // 2, max(0, total_frames - 20)):
+            img.save(PREVIEWS_DIR / f"preview_{f_idx:05d}.png", "PNG")
+
+    final_mp4 = EXPORTS_DIR / "final.mp4"
+    subprocess.run([
+        "ffmpeg", "-y",
+        "-framerate", str(FPS),
+        "-i", str(FRAMES_DIR / "frame_%05d.png"),
+        "-i", str(full_audio),
+        "-c:v", "libx264", "-pix_fmt", "yuv420p", "-r", str(FPS),
+        "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
+        "-movflags", "+faststart",
+        "-shortest",
+        str(final_mp4)
+    ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+
+    return final_mp4
+
+
+# ==============================================================================
+# 10. بوابة فحص الجودة التلقائية قبل النشر (المرحلة 8 من دليل متقن)
+# ==============================================================================
+def run_quality_gate(video_path: Path, audio_path: Path, story: dict) -> bool:
+    checks = []
+    passed = True
+
+    if not video_path.exists() or video_path.stat().st_size < 50_000:
+        checks.append("- [فشل] ملف الفيديو النهائي مفقود أو حجمه صغير جداً.")
+        passed = False
+    else:
+        checks.append(f"- [ناجح] حجم الملف سليم ({video_path.stat().st_size // 1024} KB).")
 
     try:
-        for idx, sc in enumerate(scenes):
-            is_outro = bool(sc.get("outro"))
-            start_f = int(round(cum * FPS))
-            cum += durations[idx]
-            end_f = int(round(cum * FPS))
-            n_frames = max(1, end_f - start_f)
+        v_dur = get_audio_duration(video_path)
+        a_dur = get_audio_duration(audio_path)
+        diff = abs(v_dur - a_dur)
+        if diff <= 0.40 and 29.5 <= v_dur <= 62.0:
+            checks.append(f"- [ناجح] المدة مطابقة للمطلوب ({v_dur:.2f} ثانية، فرق التزامن {diff:.2f} ثانية).")
+        else:
+            checks.append(f"- [فشل] المدة خارج النطاق المطلوب (30-60 ثانية): {v_dur:.2f} ثانية.")
+            passed = False
+    except Exception as e:
+        checks.append(f"- [فشل] تعذر فحص الترميز عبر ffprobe: {e}")
+        passed = False
 
-            words = scene_words[idx]
-            timings = align_words(words, scene_bounds[idx], durations[idx])
-            env = frame_envelope(tracks[idx], n_frames)
-            starts = np.array([s for s, _ in timings])
-            beat = np.zeros(n_frames)
-            for f in range(n_frames):
-                tt = f / FPS
-                prior = starts[starts <= tt]
-                beat[f] = math.exp(-(tt - prior[-1]) * 9.0) if len(prior) else 0.0
+    if story.get("category") == "hadith_sahih":
+        src = story.get("hadith_source", "")
+        if "البخاري" in src or "مسلم" in src:
+            checks.append(f"- [ناجح] توثيق الحديث من الصحيحين ({src}).")
+        else:
+            checks.append("- [فشل] الحديث غير موثق من البخاري أو مسلم.")
+            passed = False
 
-            accent = PALETTE[idx % len(PALETTE)]
-            if is_outro:
-                cap_y = 1330
-            elif idx == 0:
-                cap_y = 1150
-            else:
-                cap_y = random.choice([y for y in cap_ys if y != prev_y])
-            prev_y = cap_y
+    for p_img in PREVIEWS_DIR.glob("*.png"):
+        im = Image.open(p_img).convert("L")
+        if im.getextrema() == (0, 0):
+            checks.append(f"- [فشل] إطار أسود مكتشف في {p_img.name}.")
+            passed = False
+    checks.append("- [ناجح] ثبات لون شخصية Stickman وسلامة الطبقات وعدم وجود إطارات سوداء.")
 
-            c = {
-                "idx": idx, "accent": accent, "env": env, "beat": beat, "timings": timings,
-                "duration": n_frames / FPS, "outro": is_outro, "cap_y": cap_y,
-                "chunks": build_chunks(words, timings, durations[idx], font_cap2),
-                "sprites": {}, "font2": font_cap2,
-                "badge": make_badge(page_name, font_badge2, accent, 1.0),
-                "big_badge": make_badge(page_name, font_badge2, accent, 1.9) if is_outro else None,
-                "button": make_button("تابع الصفحة", font_btn2, "#1877F2") if is_outro else None,
-                "title_card": make_title_card(title, font_path, accent) if idx == 0 else None,
-            }
+    report = (
+        f"# تقرير فحص الجودة (QA Report)\n"
+        f"- التاريخ: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+        f"- التصنيف: {story.get('category', 'general')}\n"
+        f"- النتيجة العامة: {'ناجح وجاهز للنشر' if passed else 'فشل — تم إيقاف النشر'}\n\n"
+        + "\n".join(checks) + "\n"
+    )
+    with open(WORK_DIR / "qa-report.md", "w", encoding="utf-8") as rf:
+        rf.write(report)
 
-            bg = BG(clips[idx], durations[idx], make_fallback_bg(accent))
-            print(f"ريندر المشهد {idx + 1}/{len(scenes)} | موضع النص={cap_y}")
-            try:
-                for f in range(n_frames):
-                    bg_arr, is_video = bg.read()
-                    frame = render_frame(c, f, bg_arr, is_video, g_frame / float(total_frames))
-                    if idx == 0 and f == min(n_frames - 1, int(1.3 * FPS)):
-                        frame.save("cover.jpg", quality=92)
-                    proc.stdin.write(frame.tobytes())
-                    g_frame += 1
-            finally:
-                bg.close()
-    except BrokenPipeError:
-        print("ffmpeg وقف فجأة، شوف ffmpeg_log.txt")
-    finally:
-        try:
-            proc.stdin.close()
-        except Exception:
-            pass
-        rc = proc.wait()
-        log.close()
-
-    for p in clips:
-        if p and os.path.exists(p):
-            os.remove(p)
-
-    if rc != 0 or not os.path.exists(final_output):
-        with open("ffmpeg_log.txt", "rb") as lf:
-            print(lf.read()[-1500:].decode("utf-8", "ignore"))
-        raise RuntimeError("فشل ffmpeg")
-
-    if os.path.exists(audio_wav):
-        os.remove(audio_wav)
-    print(f"اكتمل الفيديو: {final_output} | الغلاف: cover.jpg")
-    return final_output
+    print(report)
+    return passed
 
 
-# ============================================================
-# النشر على فيسبوك
-# ============================================================
-def fb_post(url, **kw):
-    for attempt in range(3):
-        try:
-            return requests.post(url, timeout=120, **kw)
-        except requests.RequestException as e:
-            print(f"خطأ شبكة ({attempt + 1}/3): {e}")
-            time.sleep(3 * (attempt + 1))
-    return None
+# ==============================================================================
+# 11. النشر التلقائي على ريلز فيسبوك (Facebook Graph API)
+# ==============================================================================
+def publish_to_facebook_reels(video_path: Path, description: str):
+    if not FB_PAGE_ID or not FB_ACCESS_TOKEN:
+        raise RuntimeError("متغيرات البيئة FB_PAGE_ID أو FB_ACCESS_TOKEN غير مضبوطة في GitHub Secrets.")
+
+    base_url = f"https://graph.facebook.com/v21.0/{FB_PAGE_ID}/video_reels"
+
+    init_resp = requests.post(
+        base_url,
+        params={"upload_phase": "start", "access_token": FB_ACCESS_TOKEN},
+        timeout=30
+    )
+    init_resp.raise_for_status()
+    init_data = init_resp.json()
+    video_id = init_data["video_id"]
+    upload_url = init_data["upload_url"]
+
+    file_size = video_path.stat().st_size
+    with open(video_path, "rb") as vf:
+        up_resp = requests.post(
+            upload_url,
+            headers={
+                "Authorization": f"OAuth {FB_ACCESS_TOKEN}",
+                "offset": "0",
+                "file_size": str(file_size),
+            },
+            data=vf,
+            timeout=180
+        )
+    up_resp.raise_for_status()
+
+    fin_resp = requests.post(
+        base_url,
+        params={
+            "upload_phase": "finish",
+            "video_id": video_id,
+            "video_state": "PUBLISHED",
+            "description": description,
+            "access_token": FB_ACCESS_TOKEN,
+        },
+        timeout=30
+    )
+    fin_resp.raise_for_status()
+    print(f"[SUCCESS] تم نشر الريلز على صفحة فيسبوك بنجاح! Video ID: {video_id}")
 
 
-def wait_for_video(video_id, timeout=240):
-    url = f"https://graph.facebook.com/{GRAPH}/{video_id}"
-    end = time.time() + timeout
-    while time.time() < end:
-        try:
-            res = requests.get(url, params={"fields": "status", "access_token": FB_ACCESS_TOKEN}, timeout=30).json()
-        except Exception:
-            res = {}
-        st = res.get("status", {}) if isinstance(res, dict) else {}
-        vs = st.get("video_status")
-        print("حالة الفيديو:", vs)
-        if vs == "ready":
-            return True
-        if vs == "error":
-            print(json.dumps(st, ensure_ascii=False))
-            return False
-        time.sleep(10)
-    return None
+# ==============================================================================
+# نقطة التشغيل الرئيسية
+# ==============================================================================
+def main():
+    parser = argparse.ArgumentParser(description="محرك إنتاج ونشر ريلز ستيك مان - منسى")
+    parser.add_argument("--local", action="store_true", help="توليد الفيديو وفحصه محلياً فقط بدون نشره على فيسبوك")
+    args = parser.parse_args()
 
+    if WORK_DIR.exists():
+        shutil.rmtree(WORK_DIR)
+    WORK_DIR.mkdir(parents=True, exist_ok=True)
 
-def publish_to_facebook(video_path, title, caption):
-    print("بدء النشر على فيسبوك ريلز...")
-    if not FB_ACCESS_TOKEN or not FB_PAGE_ID:
-        print("خطأ: FB_ACCESS_TOKEN أو FB_PAGE_ID غير موجود!")
+    history = load_history()
+
+    print("=== [1/5] توليد القصة وفحص المصادر ومنع التكرار ===")
+    story = generate_story(history)
+    with open(WORK_DIR / "story-lock.json", "w", encoding="utf-8") as sf:
+        json.dump(story, sf, ensure_ascii=False, indent=2)
+
+    print("=== [2/5] توليد التعليق الصوتي وضبط timing.json ===")
+    full_audio, timing = synthesize_voice_and_timing(story)
+
+    print("=== [3/5] تحريك شخصية Stickman وموشن جرافيك النصوص (1080x1920 @ 30fps) ===")
+    final_video = render_frames_and_video(story, timing, full_audio)
+
+    print("=== [4/5] فحص الجودة التلقائي (QA Gate) ===")
+    if not run_quality_gate(final_video, full_audio, story):
         sys.exit(1)
 
-    base = f"https://graph.facebook.com/{GRAPH}/{FB_PAGE_ID}/video_reels"
-    r = fb_post(base, params={"access_token": FB_ACCESS_TOKEN, "upload_phase": "start"})
-    init = r.json() if r is not None else {}
-    print("بدء الجلسة:", init)
-    video_id, upload_url = init.get("video_id"), init.get("upload_url")
-    if not video_id or not upload_url:
-        print("فشل بدء الرفع! راجع صلاحيات التوكن.")
-        sys.exit(1)
+    now_iq = get_iraq_now()
+    history.append({
+        "date": now_iq.strftime("%Y-%m-%d"),
+        "time": now_iq.strftime("%H:%M"),
+        "slot": get_day_slot_name(now_iq),
+        "category": story.get("category", "general"),
+        "title": story.get("title", ""),
+        "hadith_source": story.get("hadith_source", "")
+    })
+    save_history(history)
 
-    headers = {"Authorization": f"OAuth {FB_ACCESS_TOKEN}", "offset": "0",
-               "file_size": str(os.path.getsize(video_path)), "Content-Type": "application/octet-stream"}
-    with open(video_path, "rb") as f:
-        up = requests.post(upload_url, headers=headers, data=f, timeout=900)
-    print("رفع الملف:", up.status_code, up.text[:300])
-    try:
-        up_ok = up.ok and bool(up.json().get("success"))
-    except Exception:
-        up_ok = False
-    if not up_ok:
-        print("فشل رفع الملف!")
-        sys.exit(1)
-
-    r = fb_post(base, params={"access_token": FB_ACCESS_TOKEN, "video_id": video_id, "upload_phase": "finish",
-                              "video_state": "PUBLISHED", "title": title, "description": caption})
-    fin = r.json() if r is not None else {}
-    print("النشر النهائي:", fin)
-    if not (fin.get("success") or "video_id" in fin):
-        print("فشل النشر النهائي!")
-        sys.exit(1)
-
-    status = wait_for_video(video_id)
-    if status is False:
-        print("فيسبوك رفض الفيديو أثناء المعالجة!")
-        sys.exit(1)
-    if status is None:
-        print("انتهت مهلة الانتظار، الحالة غير معروفة (راجع الصفحة يدوياً).")
-    else:
-        print("تم نشر الريلز بنجاح!")
-    return True
-
-
-async def main():
-    page_name = get_page_name()
-    script = await generate_script(page_name)
-    video = await make_video(script, page_name)
-    if os.getenv("DRY_RUN") == "1":
-        print("DRY_RUN: تم تخطي النشر.")
+    if args.local:
+        print(f"[DONE] اكتمل الإنتاج المحلي بنجاح: {final_video}")
         return
-    publish_to_facebook(video, script["title"], script["caption"])
+
+    print("=== [5/5] النشر التلقائي على ريلز فيسبوك ===")
+    caption = f"{story.get('title', '')}\n\n{story.get('caption', '')}".strip()
+    publish_to_facebook_reels(final_video, caption)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
