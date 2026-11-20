@@ -34,15 +34,10 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install system tools and fonts
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq ffmpeg fonts-noto-core fonts-arabeyes libcairo2-dev
-
       - name: Install Python dependencies
         run: |
           pip install --upgrade pip -q
-          pip install -q requests pillow edge-tts pycairo
+          pip install -q requests pillow edge-tts pycairo arabic-reshaper python-bidi
 
       - name: Generate and Publish Reel
         env:
