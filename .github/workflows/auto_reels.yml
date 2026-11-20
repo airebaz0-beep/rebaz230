@@ -34,10 +34,10 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install Cairo and Python dependencies
+      - name: Install Cairo, FFmpeg and Python dependencies
         run: |
           sudo apt-get update -o Acquire::http::Timeout="15" -qq
-          sudo apt-get install -y -qq --no-install-recommends libcairo2-dev pkg-config
+          sudo apt-get install -y -qq --no-install-recommends ffmpeg libcairo2-dev pkg-config
           pip install --upgrade pip -q
           pip install -q requests pillow edge-tts pycairo arabic-reshaper python-bidi
 
