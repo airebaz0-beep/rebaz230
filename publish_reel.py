@@ -31,7 +31,6 @@ FPS = 30
 IRAQ_TZ = timezone(timedelta(hours=3))
 FB_GRAPH_VERSION = os.getenv("FB_GRAPH_VERSION", "v22.0")
 
-# لوحة ألوان منسى (Ink, Bone, Rust, Lichen, Signal Lime)
 PALETTE = {
     "ink": (0x12 / 255.0, 0x14 / 255.0, 0x1A / 255.0),
     "ink_soft": (0x1E / 255.0, 0x22 / 255.0, 0x2D / 255.0),
@@ -127,54 +126,8 @@ def shape_ar(text: str) -> str:
     return get_display(reshaped)
 
 
-def find_project_fonts():
-    bold_candidates = (
-        glob.glob("*Bold*.ttf")
-        + glob.glob("*Bold*.otf")
-        + ["/usr/share/fonts/truetype/noto/NotoSansArabic-Bold.ttf"]
-    )
-    reg_candidates = (
-        glob.glob("*Medium*.ttf")
-        + glob.glob("*Regular*.ttf")
-        + ["/usr/share/fonts/truetype/noto/NotoSansArabic-Regular.ttf"]
-    )
-    bold_font = next((f for f in bold_candidates if os.path.exists(f)), None)
-    reg_font = next((f for f in reg_candidates if os.path.exists(f)), bold_font)
-    return bold_font, reg_font
-
-
-def make_cairo_font_face(font_path: str):
-    import ctypes
-
-    if not font_path or not os.path.exists(font_path):
-        return None
-    try:
-        ft_lib = ctypes.CDLL("libfreetype.so.6")
-        cairo_lib = ctypes.CDLL("libcairo.so.2")
-
-        ft_library = ctypes.c_void_p()
-        if ft_lib.FT_Init_FreeType(ctypes.byref(ft_library)) != 0:
-            return None
-
-        ft_face = ctypes.c_void_p()
-        if ft_lib.FT_New_Face(ft_library, font_path.encode("utf-8"), 0, ctypes.byref(ft_face)) != 0:
-            return None
-
-        cairo_lib.cairo_ft_font_face_create_for_ft_face.argtypes = [ctypes.c_void_p, ctypes.c_int]
-        cairo_lib.cairo_ft_font_face_create_for_ft_face.restype = ctypes.c_void_p
-        face_ptr = cairo_lib.cairo_ft_font_face_create_for_ft_face(ft_face, 0)
-        if not face_ptr:
-            return None
-
-        # تغليف المؤشر كـ Pycairo FontFace
-        import pycairo  # noqa: F401
-        return None
-    except Exception:
-        return None
-
-
 # ==============================================================================
-# 4. توليد القصة من Gemini مع بنك الأحاديث وإعادة المحاولة
+# 4. توليد القصة من Gemini مع اكتشاف الموديل المتاح تلقائياً
 # ==============================================================================
 def load_history():
     if os.path.exists(HISTORY_FILE):
@@ -212,6 +165,35 @@ def pick_next_hadith():
     if not available:
         available = VERIFIED_HADITH_BANK
     return random.choice(available)
+
+
+def discover_available_gemini_models(api_key: str) -> list:
+    preferred = [
+        "gemini-2.5-flash",
+        "gemini-2.5-pro",
+        "gemini-flash-latest",
+        "gemini-2.0-flash",
+        "gemini-1.5-flash-latest",
+    ]
+    try:
+        resp = requests.get(
+            "https://generativelanguage.googleapis.com/v1beta/models",
+            headers={"x-goog-api-key": api_key},
+            timeout=15,
+        )
+        if resp.status_code == 200:
+            found = []
+            for m in resp.json().get("models", []):
+                if "generateContent" in m.get("supportedGenerationMethods", []):
+                    name = m.get("name", "").replace("models/", "")
+                    if name and "flash" in name:
+                        found.append(name)
+            ordered = [m for m in preferred if m in found] + [m for m in found if m not in preferred]
+            if ordered:
+                return ordered[:4]
+    except Exception:
+        pass
+    return preferred
 
 
 def generate_story_with_gemini(hadith_item: dict) -> dict:
@@ -264,8 +246,8 @@ def generate_story_with_gemini(hadith_item: dict) -> dict:
 القيم المسموحة لـ prop هي فقط: question, steps, light, heart.
 """
 
-    models = ["gemini-2.5-flash", "gemini-2.0-flash"]
     if api_key:
+        models = discover_available_gemini_models(api_key)
         for model in models:
             url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
             headers = {
@@ -279,15 +261,14 @@ def generate_story_with_gemini(hadith_item: dict) -> dict:
                     "responseMimeType": "application/json",
                 },
             }
-            for attempt in range(3):
+            for attempt in range(2):
                 try:
-                    resp = requests.post(url, headers=headers, json=payload, timeout=35)
+                    resp = requests.post(url, headers=headers, json=payload, timeout=30)
                     if resp.status_code == 200:
                         data = resp.json()
                         raw = data["candidates"][0]["content"]["parts"][0]["text"]
                         parsed = json.loads(raw)
                         if isinstance(parsed.get("scenes"), list) and len(parsed["scenes"]) >= 3:
-                            # ضمان سلامة نص الحديث في المشهد الثالث
                             parsed["scenes"][2]["narration"] = (
                                 f"{hadith_item['hadith_text']} — {hadith_item['source']}"
                             )
@@ -299,9 +280,8 @@ def generate_story_with_gemini(hadith_item: dict) -> dict:
                         print(f"⚠️ {model} محاولة {attempt+1} أعادت الحالة {resp.status_code}")
                 except Exception as e:
                     print(f"⚠️ خطأ اتصال مع {model}: {e}")
-                time.sleep(2 * (attempt + 1))
+                time.sleep(1.5)
 
-    # سيناريو احتياطي مصاغ بعناية إذا تعذر الاتصال
     print("ℹ️ استخدام السيناريو الاحتياطي المتقن للحديث المختار.")
     return {
         "hadith_id": hadith_item["id"],
@@ -378,7 +358,6 @@ def generate_whoosh_wav(out_wav: str, duration: float = 0.38):
             t = i / n_samples
             env = math.sin(math.pi * t) ** 2
             white = random.uniform(-1.0, 1.0)
-            # مرشح تمرير منخفض ناعم لصوت هواء هادئ
             alpha = 0.08 + 0.18 * math.sin(math.pi * t)
             prev = prev + alpha * (white - prev)
             val = int(max(-32767, min(32767, prev * env * 9500)))
@@ -389,8 +368,7 @@ def generate_whoosh_wav(out_wav: str, duration: float = 0.38):
 def generate_ambient_bed_wav(out_wav: str, total_duration: float):
     sample_rate = 48000
     n_samples = int(sample_rate * (total_duration + 1.0))
-    # كورد هادئ دافئ بترددات منخفضة مريحة للأذن
-    freqs = [146.83, 220.00, 293.66, 329.63]  # D3, A3, D4, E4
+    freqs = [146.83, 220.00, 293.66, 329.63]
     with wave.open(out_wav, "w") as wf:
         wf.setnchannels(1)
         wf.setsampwidth(2)
@@ -419,7 +397,7 @@ def build_master_audio(scenes: list) -> tuple:
     generate_whoosh_wav(whoosh_wav)
 
     timeline = []
-    current_time = 0.45  # صمت افتتاحي أنيق
+    current_time = 0.45
     voice_segments = []
 
     for idx, sc in enumerate(scenes):
@@ -427,7 +405,6 @@ def build_master_audio(scenes: list) -> tuple:
         synthesize_speech(sc["narration"], raw_wav)
         dur = get_wav_duration(raw_wav)
 
-        # تقسيم نص المشهد إلى قطع كابشن (بحد أقصى 6 كلمات للقطعة بدون حذف أي كلمة)
         words = sc["narration"].split()
         chunks = [" ".join(words[i : i + 6]) for i in range(0, len(words), 6)]
         if not chunks:
@@ -462,7 +439,6 @@ def build_master_audio(scenes: list) -> tuple:
     ambient_wav = os.path.join(BUILD_DIR, "ambient.wav")
     generate_ambient_bed_wav(ambient_wav, total_duration)
 
-    # دمج الصوتيات عبر FFmpeg مع الحفاظ على مستوى صوت المعلق (normalize=0)
     master_wav = os.path.join(BUILD_DIR, "master_audio.wav")
     cmd = ["ffmpeg", "-y", "-loglevel", "error", "-i", ambient_wav]
     filter_parts = ["[0:a]volume=0.35[bg]"]
@@ -480,7 +456,6 @@ def build_master_audio(scenes: list) -> tuple:
         mix_labels.append(lbl)
         input_idx += 1
 
-    # إضافة مؤثر Whoosh عند بداية المشاهد 2، 3، 4
     for sc_info in timeline[1:]:
         cmd.extend(["-i", whoosh_wav])
         delay_ms = int(sc_info["start"] * 1000)
@@ -532,7 +507,6 @@ def draw_flat_character(ctx, cx: float, base_y: float, t: float, mood: str):
     head_tilt = math.sin(t * 1.4) * 0.045
     blink = (int(t * 30) % 105) in (0, 1, 2)
 
-    # ظل أرضي ناعم
     ctx.set_source_rgba(0, 0, 0, 0.14)
     ctx.save()
     ctx.translate(cx, base_y)
@@ -541,27 +515,23 @@ def draw_flat_character(ctx, cx: float, base_y: float, t: float, mood: str):
     ctx.fill()
     ctx.restore()
 
-    # الساقان (بنطال داكن أنيق)
     ctx.set_source_rgb(*PALETTE["ink"])
     rounded_rect(ctx, cx - 58, base_y - 210, 46, 205, 22)
     ctx.fill()
     rounded_rect(ctx, cx + 12, base_y - 210, 46, 205, 22)
     ctx.fill()
 
-    # الحذاء
     ctx.set_source_rgb(*PALETTE["bone"])
     rounded_rect(ctx, cx - 72, base_y - 26, 66, 26, 13)
     ctx.fill()
     rounded_rect(ctx, cx + 6, base_y - 26, 66, 26, 13)
     ctx.fill()
 
-    # الجذع (سترة بلون الصدأ المميز لهوية منسى)
     torso_y = base_y - 430 + breath
     ctx.set_source_rgb(*PALETTE["rust"])
     rounded_rect(ctx, cx - 95, torso_y, 190, 240, 56)
     ctx.fill()
 
-    # ياقة داخلية عاجية
     ctx.set_source_rgb(*PALETTE["bone"])
     ctx.move_to(cx - 34, torso_y)
     ctx.line_to(cx + 34, torso_y)
@@ -569,11 +539,9 @@ def draw_flat_character(ctx, cx: float, base_y: float, t: float, mood: str):
     ctx.close_path()
     ctx.fill()
 
-    # الذراعان مع حركة إيماء طبيعية
     wave_l = math.sin(t * 2.2) * 0.12
     wave_r = -0.35 + math.cos(t * 2.5) * 0.15 if mood in ("thinking", "happy") else -math.sin(t * 2.2) * 0.12
 
-    # ذراع يسرى
     ctx.save()
     ctx.translate(cx - 95, torso_y + 45)
     ctx.rotate(0.22 + wave_l)
@@ -585,7 +553,6 @@ def draw_flat_character(ctx, cx: float, base_y: float, t: float, mood: str):
     ctx.fill()
     ctx.restore()
 
-    # ذراع يمنى
     ctx.save()
     ctx.translate(cx + 95, torso_y + 45)
     ctx.rotate(-0.22 + wave_r)
@@ -597,34 +564,28 @@ def draw_flat_character(ctx, cx: float, base_y: float, t: float, mood: str):
     ctx.fill()
     ctx.restore()
 
-    # الرقبة
     ctx.set_source_rgb(*PALETTE["skin_shadow"])
     rounded_rect(ctx, cx - 22, torso_y - 36, 44, 48, 16)
     ctx.fill()
 
-    # الرأس والملامح
     ctx.save()
     ctx.translate(cx, torso_y - 108)
     ctx.rotate(head_tilt)
 
-    # الشعر الخلفي
     ctx.set_source_rgb(*PALETTE["ink"])
     ctx.arc(0, -14, 92, math.pi * 0.9, math.pi * 2.1)
     ctx.fill()
 
-    # الوجه
     ctx.set_source_rgb(*PALETTE["skin"])
     rounded_rect(ctx, -78, -82, 156, 172, 74)
     ctx.fill()
 
-    # خصلة شعر عصرية أمامية
     ctx.set_source_rgb(*PALETTE["ink"])
     ctx.move_to(-78, -28)
     ctx.curve_to(-65, -108, 65, -112, 80, -34)
     ctx.curve_to(42, -62, -25, -58, -78, -28)
     ctx.fill()
 
-    # العيون
     ctx.set_source_rgb(*PALETTE["ink"])
     if blink:
         ctx.set_line_width(5)
@@ -638,14 +599,12 @@ def draw_flat_character(ctx, cx: float, base_y: float, t: float, mood: str):
         ctx.fill()
         ctx.arc(29, -6, 8.5, 0, 2 * math.pi)
         ctx.fill()
-        # لمعة العين
         ctx.set_source_rgb(1, 1, 1)
         ctx.arc(-32, -9, 2.8, 0, 2 * math.pi)
         ctx.fill()
         ctx.arc(26, -9, 2.8, 0, 2 * math.pi)
         ctx.fill()
 
-    # الحواجب المعبرة حسب الحالة
     ctx.set_source_rgb(*PALETTE["ink"])
     ctx.set_line_width(6.5)
     ctx.set_line_cap(cairo.LINE_CAP_ROUND)
@@ -666,7 +625,6 @@ def draw_flat_character(ctx, cx: float, base_y: float, t: float, mood: str):
         ctx.line_to(44, -26)
     ctx.stroke()
 
-    # الفم
     ctx.set_source_rgb(*PALETTE["ink"])
     ctx.set_line_width(6)
     if mood in ("happy", "calm_smile"):
@@ -681,11 +639,10 @@ def draw_flat_character(ctx, cx: float, base_y: float, t: float, mood: str):
 
 
 def draw_scene_prop(ctx, prop: str, px: float, py: float, t: float):
-    bob = math.sin(t * 3.0) * 12.0
+    bob = math.sin(float(t) * 3.0) * 12.0
     ctx.save()
     ctx.translate(px, py + bob)
 
-    # دائرة خلفية مضيئة للأيقونة
     ctx.set_source_rgba(*PALETTE["lime"], 0.22)
     ctx.arc(0, 0, 76, 0, 2 * math.pi)
     ctx.fill()
@@ -705,7 +662,7 @@ def draw_scene_prop(ctx, prop: str, px: float, py: float, t: float):
         ctx.fill()
         rounded_rect(ctx, -10, 18, 20, 12, 4)
         ctx.fill()
-    else:  # heart
+    else:
         ctx.arc(-11, -6, 13, 0, 2 * math.pi)
         ctx.arc(11, -6, 13, 0, 2 * math.pi)
         ctx.fill()
@@ -746,7 +703,6 @@ def render_video_pipe(story: dict, master_wav: str, total_duration: float, timel
     for frame_idx in range(total_frames):
         t = frame_idx / float(FPS)
 
-        # تحديد المشهد الحالي
         active_sc = timeline[-1]
         for sc in timeline:
             if sc["start"] <= t <= sc["end"]:
@@ -757,7 +713,6 @@ def render_video_pipe(story: dict, master_wav: str, total_duration: float, timel
         sc_dur = max(0.1, active_sc["end"] - active_sc["start"])
         zoom = 1.0 + 0.045 * (sc_elapsed / sc_dur)
 
-        # 1. خلفية عصرية بهوية منسى (Bone + عناصر هندسية)
         ctx.set_source_rgb(*PALETTE["bone"])
         ctx.paint()
 
@@ -766,40 +721,34 @@ def render_video_pipe(story: dict, master_wav: str, total_duration: float, timel
         ctx.scale(zoom, zoom)
         ctx.translate(-WIDTH / 2.0, -HEIGHT / 2.0)
 
-        # قوس هندسي علوي بلون الحبر الداكن
         ctx.set_source_rgb(*PALETTE["ink"])
         rounded_rect(ctx, 48, 88, WIDTH - 96, 230, 44)
         ctx.fill()
 
-        # لمسة ركنية مميزة لهوية منسى (Quarter-circle cutout accent)
         ctx.set_source_rgb(*PALETTE["lime"])
         ctx.move_to(WIDTH - 48, 88)
         ctx.arc(WIDTH - 48, 88, 62, math.pi / 2, math.pi)
         ctx.close_path()
         ctx.fill()
 
-        # دائرة خلفية ناعمة وراء الشخصية
         ctx.set_source_rgba(*PALETTE["lichen"], 0.45)
         ctx.arc(WIDTH / 2.0, 910, 330, 0, 2 * math.pi)
         ctx.fill()
 
-        # خط الأرضية
         ctx.set_source_rgba(*PALETTE["ink"], 0.25)
         ctx.set_line_width(4)
         ctx.move_to(140, 1210)
         ctx.line_to(WIDTH - 140, 1210)
         ctx.stroke()
 
-        # رسم الشخصية الكرتونية والأيقونة التفاعلية
         draw_flat_character(ctx, WIDTH / 2.0 - 40, 1210, t, active_sc["mood"])
-        draw_scene_prop(ctx, WIDTH / 2.0 + 230, 740, t, active_sc["prop"])
+        # ترتيب المعاملات الصحيح: (ctx, prop, px, py, t)
+        draw_scene_prop(ctx, active_sc["prop"], WIDTH / 2.0 + 230, 740, t)
         ctx.restore()
 
-        # 2. ترويسة الصفحة والعنوان
         draw_arabic_centered(ctx, "مَنْسَى  •  MANSA", WIDTH / 2.0, 152, 34, PALETTE["lime"], 700)
         draw_arabic_centered(ctx, story["title"], WIDTH / 2.0, 245, 50, PALETTE["bone"], 880)
 
-        # 3. بطاقة الكابشن السفلية الواضحة
         active_chunk = active_sc["chunks"][-1][2]
         for c_start, c_end, c_text in active_sc["chunks"]:
             if c_start <= t <= c_end:
@@ -812,12 +761,10 @@ def render_video_pipe(story: dict, master_wav: str, total_duration: float, timel
         rounded_rect(ctx, 64, card_y, WIDTH - 128, card_h, 42)
         ctx.fill()
 
-        # شريط جانبي برتقالي داخل البطاقة
         ctx.set_source_rgb(*PALETTE["rust"])
         rounded_rect(ctx, WIDTH - 94, card_y + 42, 12, card_h - 84, 6)
         ctx.fill()
 
-        # تقسيم الكابشن لسطرين متوازنين إذا زاد عن 3 كلمات
         c_words = active_chunk.split()
         if len(c_words) > 3:
             mid = (len(c_words) + 1) // 2
@@ -828,7 +775,6 @@ def render_video_pipe(story: dict, master_wav: str, total_duration: float, timel
         else:
             draw_arabic_centered(ctx, active_chunk, WIDTH / 2.0, card_y + 148, 56, PALETTE["bone"], 860)
 
-        # 4. شريط التقدم العلوي
         progress = min(1.0, max(0.0, t / total_duration))
         ctx.set_source_rgba(*PALETTE["ink"], 0.18)
         ctx.rectangle(0, 0, WIDTH, 14)
@@ -880,7 +826,6 @@ def publish_to_facebook_reels(mp4_path: str, caption: str) -> str:
 
     base = f"https://graph.facebook.com/{FB_GRAPH_VERSION}/{page_id}/video_reels"
 
-    # المرحلة 1: بدء جلسة الرفع
     r1 = requests.post(
         base,
         data={"upload_phase": "start", "access_token": token},
@@ -891,7 +836,6 @@ def publish_to_facebook_reels(mp4_path: str, caption: str) -> str:
     video_id = j1["video_id"]
     upload_url = j1["upload_url"]
 
-    # المرحلة 2: رفع ملف الفيديو
     file_size = os.path.getsize(mp4_path)
     with open(mp4_path, "rb") as vf:
         r2 = requests.post(
@@ -906,7 +850,6 @@ def publish_to_facebook_reels(mp4_path: str, caption: str) -> str:
         )
     r2.raise_for_status()
 
-    # المرحلة 3: إنهاء ونشر الريل
     r3 = requests.post(
         base,
         data={
@@ -920,7 +863,6 @@ def publish_to_facebook_reels(mp4_path: str, caption: str) -> str:
     )
     r3.raise_for_status()
 
-    # المرحلة 4: Polling للتأكد من اكتمال معالجة الفيديو على سيرفرات Meta
     status_url = f"https://graph.facebook.com/{FB_GRAPH_VERSION}/{video_id}"
     for _ in range(12):
         time.sleep(5)
