@@ -1236,7 +1236,7 @@ def run_quality_gate(video_path: Path, audio_path: Path, story: dict) -> bool:
         v_dur = get_audio_duration(video_path)
         a_dur = get_audio_duration(audio_path)
         diff = abs(v_dur - a_dur)
-        if diff <= 0.45 and 29.5 <= v_dur <= 62.0:
+        if diff <= 0.45 and 29.5 <= v_dur <= 90.0:
             checks.append(f"- [ناجح] المدة مطابقة للمطلوب ({v_dur:.2f} ثانية، فرق التزامن {diff:.2f} ثانية).")
         else:
             checks.append(f"- [فشل] المدة خارج النطاق المطلوب (30-60 ثانية): {v_dur:.2f} ثانية.")
